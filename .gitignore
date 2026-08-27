@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.ruff_cache/
+.pytest_cache/
+.DS_Store
+Thumbs.db
+
+# secret-file patterns (defence-in-depth; this is the exact class this
+# action scans for, so its own working copy shouldn't carry one either)
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*credentials*
+*secrets*

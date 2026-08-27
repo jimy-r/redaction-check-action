@@ -1,0 +1,12 @@
+# Explicit lint config, not ruff's bare defaults: a bare-default `ruff check`
+# silently changes what's linted across ruff releases (a prior audit in this
+# author's other repos found a default-set widening turn on 100+ findings
+# with zero code change). An explicit select makes a version bump safe.
+target-version = "py310"
+
+[lint]
+# pycodestyle + pyflakes + isort + bugbear + pyupgrade.
+select = ["E", "W", "F", "I", "B", "UP"]
+# Line length is the formatter's job; any E501 residual is a string/URL the
+# formatter deliberately leaves alone.
+ignore = ["E501"]

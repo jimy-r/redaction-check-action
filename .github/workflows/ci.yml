@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      # Pinned on purpose (see ruff.toml's own header comment): a ruff bump
+      # can silently widen its default lint set with zero code change here.
+      - run: pip install ruff==0.15.21
+      - run: ruff check .
+      - run: ruff format --check .
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.13']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m unittest test_redaction_check -v
+
+  self-test:
+    name: Dogfood the action against a fixture diff
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Add a fixture commit on top of main with a detectable shape
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.email "ci@example.invalid"
+          git config user.name "redaction-check self-test"
+          git checkout -b self-test-fixture origin/main
+          mkdir -p .fixture
+          {
+            echo "This line is clean."
+            printf 'path was /home/%s/config\n' "prodserver7"
+          } > .fixture/probe.txt
+          git add .fixture/probe.txt
+          git commit -q -m "self-test fixture: inject a detectable shape"
+
+      - name: Run the action against the dirty fixture (expect it to flag)
+        id: dirty
+        uses: ./
+        continue-on-error: true
+        with:
+          base-ref: main
+
+      - name: Assert the dirty fixture was caught
+        shell: bash
+        run: |
+          if [ "${{ steps.dirty.outcome }}" != "failure" ]; then
+            echo "::error::Self-test failed: the action did not flag the injected fixture."
+            exit 1
+          fi
+          echo "Self-test OK (positive case): the action flagged the injected fixture."
+
+      - name: Replace the fixture with clean content only
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'This line is clean.\nSo is this one.\n' > .fixture/probe.txt
+          git add .fixture/probe.txt
+          git commit -q -m "self-test fixture: clean content only"
+
+      - name: Run the action against the clean fixture (expect a pass)
+        id: clean
+        uses: ./
+        with:
+          base-ref: main
+
+      - name: Assert the clean fixture passed
+        shell: bash
+        run: |
+          if [ "${{ steps.clean.outcome }}" != "success" ]; then
+            echo "::error::Self-test failed: the action flagged content with nothing to catch."
+            exit 1
+          fi
+          echo "Self-test OK (negative case): clean content passed."

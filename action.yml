@@ -1,0 +1,77 @@
+name: Redaction check
+description: >-
+  Scan a pull request's added lines for the shapes of private content --
+  emails, absolute home paths, credential prefixes, private-IP/hostname
+  shapes, and common secret-file names -- before it merges.
+author: James Ross
+
+branding:
+  icon: shield
+  color: gray-dark
+
+inputs:
+  patterns-file:
+    description: >-
+      Path (relative to the checkout) to an optional extra denylist file,
+      one regular expression per line. Blank lines and lines starting with
+      # are skipped.
+    required: false
+    default: ''
+  fail-on:
+    description: >-
+      'match' (default) fails the step when any finding is reported. 'none'
+      always exits 0 and reports findings as warning annotations instead --
+      use this while first rolling the gate out on an existing repo.
+    required: false
+    default: match
+  scan-mode:
+    description: >-
+      'added-lines' (default) scans only lines added since base-ref, the
+      normal PR gate. 'all-files' walks every git-tracked file in the
+      checkout instead, for a full-repo audit run.
+    required: false
+    default: added-lines
+  base-ref:
+    description: >-
+      Branch or ref to diff against in added-lines mode. Defaults to the
+      pull request's base branch (github.base_ref). Set this explicitly
+      when triggering on an event other than pull_request.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.12'
+
+    - name: Scan for private-content shapes
+      shell: bash
+      env:
+        PATTERNS_FILE: ${{ inputs.patterns-file }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        SCAN_MODE: ${{ inputs.scan-mode }}
+        BASE_REF: ${{ inputs.base-ref || github.base_ref }}
+      run: |
+        set -euo pipefail
+        args=(--fail-on "$FAIL_ON")
+        if [ -n "$PATTERNS_FILE" ]; then
+          args+=(--patterns-file "$PATTERNS_FILE")
+        fi
+
+        if [ "$SCAN_MODE" = "all-files" ]; then
+          python "${{ github.action_path }}/redaction_check.py" --mode all-files "${args[@]}"
+        else
+          if [ -z "$BASE_REF" ]; then
+            echo "::error::scan-mode is added-lines but no base ref is available. Set the base-ref input, or trigger this action on pull_request."
+            exit 1
+          fi
+          # A failed fetch (e.g. the ref already exists locally with
+          # fetch-depth: 0) is not fatal -- the diff below is what matters.
+          git fetch origin "$BASE_REF" --depth=1 || true
+          git diff --unified=0 "origin/$BASE_REF...HEAD" > "$RUNNER_TEMP/redaction-check.diff"
+          python "${{ github.action_path }}/redaction_check.py" --mode added-lines \
+            --diff-file "$RUNNER_TEMP/redaction-check.diff" "${args[@]}"
+        fi
