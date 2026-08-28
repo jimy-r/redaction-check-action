@@ -1,0 +1,4 @@
+# CI toolchain pin. Pinned on purpose (see ruff.toml's own header comment): a
+# ruff bump can silently widen its default lint set with zero code change
+# here. Dependabot watches this file so bumps arrive as PRs.
+ruff==0.15.21

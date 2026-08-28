@@ -1,0 +1,13 @@
+# CI toolchain pins are deliberate (see .github/requirements-ci.txt); this is
+# what surfaces bumps as reviewable PRs instead of depending on someone
+# remembering to check. Weekly, matches the pattern in signal-sweep.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: pip
+    directory: /.github
+    schedule:
+      interval: weekly
