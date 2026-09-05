@@ -1,0 +1,65 @@
+# Keeps the moving `v1` major tag honest.
+#
+# README tells callers that `@v1` is repointed at the newest v1.x.y on every
+# release. Nothing enforced that, so the tag would drift the moment a release
+# was cut by hand. This does the repointing: publish a v1.x.y release and v1
+# follows it. Prereleases are skipped, and a v0 or v2 release does nothing.
+#
+# To move v1 without cutting a release:
+#   git tag --force v1 v1.2.3 && git push --force origin refs/tags/v1
+name: release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  major-tag:
+    name: Point v1 at the released commit
+    if: >-
+      !github.event.release.prerelease &&
+      startsWith(github.event.release.tag_name, 'v1.')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+
+      - name: Move v1 to the released commit
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          # The job `if` only checks the v1. prefix. A moving major tag is what
+          # every caller of this action resolves to, so be strict about what is
+          # allowed to become it.
+          if ! printf '%s' "$RELEASE_TAG" | grep -Eq '^v1\.[0-9]+\.[0-9]+$'; then
+            echo "::error::$RELEASE_TAG is not a vMAJOR.MINOR.PATCH tag in the v1 series; leaving v1 where it is."
+            exit 1
+          fi
+
+          # Refuse to publish a commit that never landed on the default branch.
+          # A tag cut from an unmerged branch would otherwise become the version
+          # everyone pinned to @v1 runs. Fetch the branch by name rather than
+          # trusting a remote-tracking ref to exist in a tag checkout.
+          git fetch --no-tags origin "$DEFAULT_BRANCH"
+          if ! git merge-base --is-ancestor HEAD FETCH_HEAD; then
+            echo "::error::$RELEASE_TAG is not reachable from $DEFAULT_BRANCH; leaving v1 where it is."
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag --force v1 HEAD
+          git push --force origin refs/tags/v1
+
+          echo "v1 -> $(git rev-parse HEAD) ($RELEASE_TAG)" >> "$GITHUB_STEP_SUMMARY"
