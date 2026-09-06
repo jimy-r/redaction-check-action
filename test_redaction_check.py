@@ -729,6 +729,54 @@ class CLITests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("private/link-local IP", out)
 
+
+class GitOutputEncodingTests(unittest.TestCase):
+    """A diff carrying bytes outside the host codepage must not crash the gate.
+
+    Before the encoding fix, `text=True` alone decoded git's output with the
+    Windows console codepage (cp1252) and a byte like 0x9d raised
+    UnicodeDecodeError before any pattern ran — the gate failed on content it
+    never scanned. Regression guard for that.
+    """
+
+    @staticmethod
+    def _init_repo(tmp: str) -> None:
+        subprocess.run(["git", "init", "-q"], cwd=tmp, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"], cwd=tmp, check=True
+        )
+        subprocess.run(["git", "config", "user.name", "test"], cwd=tmp, check=True)
+
+    def test_diff_with_non_cp1252_bytes_is_scannable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_repo(tmp)
+            base = Path(tmp) / "base.txt"
+            base.write_text("nothing here\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=tmp, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=tmp, check=True)
+
+            # 0x9d is undefined in cp1252. Written as raw bytes so the file is
+            # not valid UTF-8 either — the harshest case for the decoder.
+            (Path(tmp) / "odd.txt").write_bytes(
+                b"internal host " + b"10.20.30.40" + b" caf\x9d\n"
+            )
+            subprocess.run(["git", "add", "-A"], cwd=tmp, check=True)
+            subprocess.run(["git", "commit", "-qm", "odd"], cwd=tmp, check=True)
+
+            diff = rc.get_diff_via_git("HEAD~1", root=tmp)
+            self.assertIn("odd.txt", diff)
+            findings = rc.scan_added_lines(diff)
+            self.assertEqual([f.label for f in findings], ["private/link-local IP"])
+
+    def test_tracked_filename_with_non_ascii_is_listed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_repo(tmp)
+            (Path(tmp) / "café.txt").write_text("clean\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=tmp, check=True)
+            self.assertIn("caf", "".join(rc.iter_tracked_files(tmp)))
+
+
+class SelftestTests(unittest.TestCase):
     def test_selftest_passes_via_direct_call(self):
         self.assertEqual(rc.run_selftest(), 0)
 

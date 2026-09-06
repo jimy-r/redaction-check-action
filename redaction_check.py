@@ -300,11 +300,20 @@ def parse_added_lines(diff_text: str) -> Iterator[tuple[str, int, str]]:
             lineno += 1  # context line present; advances but is not added
 
 
+# `text=True` alone decodes with the process's preferred encoding, which on a
+# Windows runner is the console codepage (cp1252). A diff carrying any byte
+# outside that codepage — a smart quote pasted into a doc, a UTF-8 filename, a
+# binary hunk header — then dies with UnicodeDecodeError before a single pattern
+# is scanned, so the gate fails closed on content it never looked at. Git emits
+# UTF-8; decode it as UTF-8 and replace anything undecodable, because a mangled
+# character in a diff line is still scannable and a crash is not.
 def get_diff_via_git(base: str, root: str = ".") -> str:
     return subprocess.run(
         ["git", "-C", root, "diff", "--unified=0", f"{base}...HEAD"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=True,
     ).stdout
 
@@ -314,6 +323,8 @@ def iter_tracked_files(root: str = ".") -> Iterator[str]:
         ["git", "-C", root, "ls-files"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=True,
     )
     for line in result.stdout.splitlines():
