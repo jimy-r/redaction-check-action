@@ -71,3 +71,7 @@ A clean run is a floor, not a ceiling. It means nothing here matched a known sha
 ## Origin
 
 This generalises the redaction gate built for [`agent-workspace-architecture`](https://github.com/jimy-r/agent-workspace-architecture?utm_source=github&utm_medium=repo&utm_campaign=redaction-check-action), where it runs as a required check on every pull request, including from forks, to catch what an AI agent might otherwise publish by mistake before a human reviews it. It's one of six repos published from that same workspace; the [interactive tour](https://jimy-r.github.io/agent-workspace-architecture/?utm_source=github&utm_medium=repo&utm_campaign=redaction-check-action) walks the rest.
+
+## Contributing
+
+Pattern proposals and fixes are welcome. [`CONTRIBUTING.md`](CONTRIBUTING.md) has the setup, the test gate, and the one rule that is not negotiable.
