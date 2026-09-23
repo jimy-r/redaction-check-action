@@ -566,6 +566,25 @@ class DiffParsingTests(unittest.TestCase):
     def test_empty_diff_yields_nothing(self):
         self.assertEqual(list(rc.parse_added_lines("")), [])
 
+    def test_only_a_newline_ends_a_line(self):
+        # splitlines() also broke at CR, form feed and U+2028, and the text
+        # after each break lost its "+" and was never scanned.
+        diff = (
+            "diff --git a/f.txt b/f.txt\n"
+            "--- a/f.txt\n"
+            "+++ b/f.txt\n"
+            "@@ -0,0 +1 @@\n"
+            "+one\rtwo\fthree four\n"
+        )
+        self.assertEqual(
+            list(rc.parse_added_lines(diff)), [("f.txt", 1, "one\rtwo\fthree four")]
+        )
+
+    def test_a_diff_saved_with_crlf_still_parses(self):
+        diff = "diff --git a/.env b/.env\r\n--- /dev/null\r\n+++ b/.env\r\n@@ -0,0 +1 @@\r\n+K=v\r\n"
+        got = [(path, lineno) for path, lineno, _ in rc.parse_added_lines(diff)]
+        self.assertEqual(got, [(".env", 1)])
+
 
 # ---------------------------------------------------------------------------
 # Extra patterns file
@@ -764,6 +783,34 @@ class CLITests(unittest.TestCase):
             )
         self.assertEqual(code, 1)
         self.assertIn("custom pattern", out)
+
+    CR_DIFF = (
+        "diff --git a/f.txt b/f.txt\n"
+        "--- a/f.txt\n"
+        "+++ b/f.txt\n"
+        "@@ -0,0 +1 @@\n"
+        "+clean\rhost " + "10.20.30.40" + "\n"
+    )
+
+    def test_diff_file_is_read_without_newline_translation(self):
+        # A text-mode read turned the CR into a line break, so the host
+        # after it arrived without a "+" and was never scanned.
+        with tempfile.TemporaryDirectory() as tmp:
+            diff_path = Path(tmp) / "changes.diff"
+            diff_path.write_bytes(self.CR_DIFF.encode("utf-8"))
+            code, out, _err = run_main(["--diff-file", str(diff_path)])
+        self.assertEqual(code, 1)
+        self.assertIn("private/link-local IP", out)
+
+    def test_stdin_is_read_without_newline_translation(self):
+        result = subprocess.run(
+            [sys.executable, str(THIS_DIR / "redaction_check.py")],
+            input=self.CR_DIFF.encode("utf-8"),
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(b"private/link-local IP", result.stdout)
 
     def test_all_files_mode_via_cli(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1195,6 +1242,23 @@ class GitDiffTests(unittest.TestCase):
         code, found = self.repo.scan()
         self.assertEqual(code, 1)
         self.assertEqual(found, [("s.txt", "private/link-local IP")])
+
+    def test_line_break_lookalikes_do_not_hide_a_line(self):
+        # Git ends a line at LF only. Decoding with universal newlines, then
+        # splitlines(), broke the added line early at a CR, a form feed or a
+        # U+2028, and the host after the break went unscanned.
+        files = {
+            "cr_only.txt": f"clean\rhost {IP}\r",
+            "crlf.txt": f"clean\r\nhost {IP}\r\n",
+            "form_feed.txt": f"clean\fhost {IP}\n",
+            "line_separator.txt": f"clean host {IP}\n",
+        }
+        for name, text in files.items():
+            self.repo.write(name, text.encode("utf-8"))
+        self.repo.commit("add")
+        code, found = self.repo.scan()
+        self.assertEqual(code, 1)
+        self.assertEqual(sorted(found), [(n, "private/link-local IP") for n in files])
 
 
 class ActionDefinitionTests(unittest.TestCase):

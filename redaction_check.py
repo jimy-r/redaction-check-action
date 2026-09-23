@@ -276,15 +276,19 @@ def parse_added_lines(diff_text: str) -> Iterator[tuple[str, int, str]]:
     end of file" marker. Context lines (present in a diff generated with
     more than zero lines of context) advance the line counter without being
     yielded, so this also works on a normal, non `--unified=0` diff.
+
+    Lines split on "\\n" only. A CR, a form feed or a U+2028 inside an added
+    line is part of its content, never a break that would strip the "+" from
+    the text after it and hide that text from the scan.
     """
     path: str | None = None
     lineno = 0
-    for line in diff_text.splitlines():
+    for line in diff_text.split("\n"):
         if DIFF_HEADER_RE.match(line):
             path = None  # each file block starts clean; no cross-file bleed
             continue
         if line.startswith("+++ "):
-            new_path = line[4:]
+            new_path = line[4:].rstrip("\r")  # a diff file saved with CRLF
             if new_path == "/dev/null":
                 path = None
             elif new_path.startswith("b/"):
@@ -309,26 +313,25 @@ def parse_added_lines(diff_text: str) -> Iterator[tuple[str, int, str]]:
             lineno += 1  # context line present; advances but is not added
 
 
-# `text=True` alone decodes with the process's preferred encoding, which on a
-# Windows runner is the console codepage (cp1252). A diff carrying any byte
-# outside that codepage — a smart quote pasted into a doc, a UTF-8 filename, a
-# binary hunk header — then dies with UnicodeDecodeError before a single pattern
-# is scanned, so the gate fails closed on content it never looked at. Git emits
-# UTF-8; decode it as UTF-8 and replace anything undecodable, because a mangled
-# character in a diff line is still scannable and a crash is not.
-def _git(root: str, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", "-C", root, *args],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
+# Git's output is captured as bytes and decoded by _text, never by subprocess.
+# `text=True` decodes with the process's preferred encoding, which on a Windows
+# runner is the console codepage (cp1252), so a diff carrying any byte outside
+# it (a smart quote pasted into a doc, a UTF-8 filename) died with
+# UnicodeDecodeError before a single pattern ran. It also turns on universal
+# newlines, which rewrite a lone CR as a line break, so the second line of a
+# CR-only file lost its "+" and was never scanned. Git emits UTF-8. Decode it
+# as UTF-8 and replace anything undecodable, because a mangled character in a
+# diff line is still scannable and a crash is not.
+def _git(root: str, *args: str) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(["git", "-C", root, *args], capture_output=True, check=False)
 
 
-def _last_error_line(result: subprocess.CompletedProcess[str]) -> str:
-    lines = result.stderr.strip().splitlines()
+def _text(data: bytes) -> str:
+    return data.decode("utf-8", "replace")
+
+
+def _last_error_line(result: subprocess.CompletedProcess[bytes]) -> str:
+    lines = _text(result.stderr).strip().splitlines()
     return lines[-1] if lines else f"git exited with status {result.returncode}"
 
 
@@ -347,7 +350,7 @@ def commit_parents(rev: str, root: str = ".") -> list[str]:
     if result.returncode != 0:
         raise DiffError(f"cannot read commit {rev}: {_last_error_line(result)}")
     parents = []
-    for line in result.stdout.splitlines():
+    for line in _text(result.stdout).split("\n"):
         if not line:
             break  # end of the header; a message line may start with "parent "
         if line.startswith("parent "):
@@ -361,14 +364,15 @@ def _has_commit(rev: str, root: str) -> bool:
 
 def _history_is_complete(rev: str, root: str) -> bool:
     """True when no shallow boundary cuts off any ancestor of rev."""
-    if _git(root, "rev-parse", "--is-shallow-repository").stdout.strip() != "true":
+    shallow = _git(root, "rev-parse", "--is-shallow-repository")
+    if _text(shallow.stdout).strip() != "true":
         return True
     roots = _git(root, "rev-list", "--max-parents=0", rev)
     if roots.returncode != 0:
         return False
     # A shallow boundary is listed as a root, but its commit object still
     # names the parents the clone does not have.
-    return not any(commit_parents(sha, root) for sha in roots.stdout.split())
+    return not any(commit_parents(sha, root) for sha in _text(roots.stdout).split())
 
 
 def _rewritten_base_range(
@@ -388,7 +392,7 @@ def _rewritten_base_range(
     resolved = _git(root, "rev-parse", "--verify", f"{base}^{{commit}}")
     if resolved.returncode != 0:
         return None
-    base_sha = resolved.stdout.strip()
+    base_sha = _text(resolved.stdout).strip()
     contains = _git(root, "merge-base", "--is-ancestor", first_parent, base_sha)
     if contains.returncode == 0:
         return None
@@ -398,7 +402,7 @@ def _rewritten_base_range(
             f"HEAD against its merge base with {base}, because {base} was "
             "rewritten and no longer contains the commit the test merge was built on"
         )
-        return merge_base.stdout.strip(), head_sha, how
+        return _text(merge_base.stdout).strip(), head_sha, how
     if _history_is_complete(base_sha, root):
         raise DiffError(
             f"{base} no longer contains {first_parent[:12]}, the commit this test "
@@ -433,7 +437,7 @@ def resolve_diff_range(
     head = _git(root, "rev-parse", "--verify", "HEAD^{commit}")
     if head.returncode != 0:
         raise DiffError(f"HEAD does not name a commit: {_last_error_line(head)}")
-    head_sha = head.stdout.strip()
+    head_sha = _text(head.stdout).strip()
 
     how = f"HEAD against its merge base with {base}"
     if pr_head:
@@ -479,20 +483,21 @@ def resolve_diff_range(
             f"{base} does not name a commit in this clone. Check out with "
             "fetch-depth: 0 so the base branch's history is present."
         )
-    merge_base = _git(root, "merge-base", base_commit.stdout.strip(), head_sha)
+    base_sha = _text(base_commit.stdout).strip()
+    merge_base = _git(root, "merge-base", base_sha, head_sha)
     if merge_base.returncode != 0:
-        shallow = _git(root, "rev-parse", "--is-shallow-repository").stdout.strip()
+        shallow = _git(root, "rev-parse", "--is-shallow-repository")
         hint = (
             " This clone is shallow, which hides the history they share. Check "
             "out with fetch-depth: 0, and never re-fetch the base with --depth."
-            if shallow == "true"
+            if _text(shallow.stdout).strip() == "true"
             else " Their histories share no commit."
         )
         raise DiffError(
             f"{base} and HEAD have no merge base, so the lines HEAD adds cannot "
             f"be worked out.{hint}"
         )
-    return merge_base.stdout.strip(), head_sha, how
+    return _text(merge_base.stdout).strip(), head_sha, how
 
 
 def git_diff(from_commit: str, to_commit: str, root: str = ".") -> str:
@@ -501,7 +506,7 @@ def git_diff(from_commit: str, to_commit: str, root: str = ".") -> str:
     result = _git(root, "diff", "--no-color", "--unified=0", from_commit, to_commit)
     if result.returncode != 0:
         raise DiffError(f"git diff failed: {_last_error_line(result)}")
-    return result.stdout
+    return _text(result.stdout)
 
 
 def get_diff_via_git(base: str, root: str = ".", pr_head: str | None = None) -> str:
@@ -715,10 +720,13 @@ def main(argv: list[str] | None = None) -> int:
                     "::notice::That range has no changes, so there was nothing to scan."
                 )
         elif args.diff_file and args.diff_file != "-":
-            with open(args.diff_file, encoding="utf-8", errors="replace") as f:
-                diff_text = f.read()
+            # Bytes, as for git's own output: a text-mode read would turn a
+            # lone CR into a line break before the parser saw the line.
+            with open(args.diff_file, "rb") as f:
+                diff_text = _text(f.read())
         else:
-            diff_text = sys.stdin.read()
+            stdin_bytes = getattr(sys.stdin, "buffer", None)
+            diff_text = _text(stdin_bytes.read()) if stdin_bytes else sys.stdin.read()
         findings = scan_added_lines(diff_text, extra_patterns)
 
     return report(findings, args.fail_on)
