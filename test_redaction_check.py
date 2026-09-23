@@ -734,6 +734,12 @@ class ExtraPatternsTests(unittest.TestCase):
 
 
 class ScanAddedLinesTests(unittest.TestCase):
+    def test_nul_bytes_between_characters_do_not_hide_a_match(self):
+        self.assertEqual(
+            rc.scan_line("\x00".join(f"host {IP}")),
+            [("private/link-local IP", IP)],
+        )
+
     def test_new_dotenv_file_is_flagged_once_not_per_line(self):
         diff = (
             "diff --git a/.env b/.env\n"
@@ -1628,6 +1634,23 @@ class GitDiffTests(unittest.TestCase):
             [("notes.png", "private/link-local IP", leaking_commit[:12])],
         )
         self.assertEqual(len(FINDING_RE.findall(out)), 1)
+
+    def test_utf16_text_is_scanned(self):
+        # PowerShell 5's `>` writes UTF-16 with a BOM. --text prints its lines,
+        # but with a NUL after every ASCII character no pattern matched.
+        text = (
+            "Ethernet adapter:\r\n"
+            f"   IPv4 Address. . : {IP}\r\n"
+            "   Owner: real.person@gm" + "ail.com\r\n"
+        )
+        self.repo.write("net.txt", text.encode("utf-16"))
+        self.repo.commit("add")
+        code, found = self.repo.scan()
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            sorted(found),
+            [("net.txt", "email address"), ("net.txt", "private/link-local IP")],
+        )
 
     def test_file_whose_line_looks_like_a_header_is_scanned(self):
         self.repo.write("pp.txt", f"++ /dev/null\nhost {IP}\n".encode())

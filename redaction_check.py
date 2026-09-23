@@ -302,7 +302,12 @@ def check_filename(path: str) -> str | None:
 def scan_line(
     text: str, extra_patterns: Iterable[tuple[str, re.Pattern[str]]] = ()
 ) -> list[tuple[str, str]]:
-    """Return (label, matched_text) pairs for one line of text."""
+    """Return (label, matched_text) pairs for one line of text.
+
+    NUL bytes are dropped first. UTF-16 text, which is what PowerShell 5's `>`
+    writes, has one after every ASCII character, and no pattern matched it.
+    """
+    text = text.replace("\x00", "")
     if SUPPRESS_MARKER in text:
         return []
     hits: list[tuple[str, str]] = []
