@@ -851,6 +851,33 @@ class ScanAllFilesTests(unittest.TestCase):
         self.assertEqual(walked, ["test_redaction_check.py"])
         self.assertEqual(skipped, [])
 
+    def test_a_byte_that_is_not_utf8_does_not_skip_the_file(self):
+        # A strict decode gave up on the whole file at the Latin-1 byte.
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["git", "init", "-q"], cwd=tmp, check=True)
+            text = b"caf\xe9 menu\nhost " + IP.encode() + b"\n"
+            (Path(tmp) / "latin1.txt").write_bytes(text)
+            subprocess.run(["git", "add", "-A"], cwd=tmp, check=True)
+            found = [(f.path, f.line, f.label) for f in rc.scan_all_files(tmp)]
+        self.assertEqual(found, [("latin1.txt", 2, "private/link-local IP")])
+
+    def test_media_content_is_skipped_only_for_the_real_format(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["git", "init", "-q"], cwd=tmp, check=True)
+            payload = b" host " + IP.encode() + b"\n"
+            (Path(tmp) / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n" + payload)
+            (Path(tmp) / "notes.png").write_bytes(payload)
+            (Path(tmp) / "net.txt").write_bytes(payload.decode().encode("utf-16"))
+            subprocess.run(["git", "add", "-A"], cwd=tmp, check=True)
+            found = sorted((f.path, f.label) for f in rc.scan_all_files(tmp))
+        self.assertEqual(
+            found,
+            [
+                ("net.txt", "private/link-local IP"),
+                ("notes.png", "private/link-local IP"),
+            ],
+        )
+
     def test_secret_file_under_a_non_ascii_directory_is_found(self):
         # Plain `git ls-files` quoted this name, so it neither matched a
         # secret filename nor opened for the content scan.

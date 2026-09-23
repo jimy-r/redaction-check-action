@@ -1010,14 +1010,17 @@ def scan_all_files(
         try:
             if full_path.stat().st_size > MAX_FILE_BYTES:
                 continue
-            with open(full_path, encoding="utf-8") as f:
-                for lineno, text in enumerate(f, start=1):
-                    for hit_label, matched in scan_line(text, extra_patterns):
-                        findings.append(
-                            Finding(rel_path, lineno, hit_label, mask(matched))
-                        )
-        except (UnicodeDecodeError, OSError):
-            continue  # binary or unreadable; the filename check above still ran
+            data = full_path.read_bytes()
+        except OSError:
+            continue  # unreadable; the filename check above still ran
+        if is_media(rel_path, data[:MEDIA_HEAD_BYTES]):
+            continue  # real binary media, whose content is skipped in both modes
+        # Decoded with replacement, like git's output. A strict decode skipped
+        # the whole file at its first byte that was not UTF-8, secrets and
+        # all. Lines split on "\n" only, as git numbers them.
+        for lineno, text in enumerate(_text(data).split("\n"), start=1):
+            for hit_label, matched in scan_line(text, extra_patterns):
+                findings.append(Finding(rel_path, lineno, hit_label, mask(matched)))
     return findings
 
 
