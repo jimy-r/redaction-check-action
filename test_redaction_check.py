@@ -1,4 +1,5 @@
-"""Offline unittests for redaction_check.py. No network, no real git remote.
+"""Offline unittests for redaction_check.py. No network: every git repository,
+including the one that stands in for a remote, is a local temp directory.
 
 Fake credential/path shapes below are built by string concatenation rather
 than written as contiguous literals, so this file itself carries no string
@@ -799,6 +800,219 @@ class GitOutputEncodingTests(unittest.TestCase):
             (Path(tmp) / "café.txt").write_text("clean\n", encoding="utf-8")
             subprocess.run(["git", "add", "-A"], cwd=tmp, check=True)
             self.assertIn("caf", "".join(rc.iter_tracked_files(tmp)))
+
+
+# ---------------------------------------------------------------------------
+# Diff range -- a base branch that moves while the check is queued
+# ---------------------------------------------------------------------------
+
+
+def git_out(cwd: str | Path, *args: str) -> str:
+    """Run git in cwd and return its stdout, failing the test on an error."""
+    result = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AssertionError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+class MovedBaseTests(unittest.TestCase):
+    """A base branch that moves while the check is queued must not break the scan.
+
+    The fixture models the failure seen in a consuming repository. GitHub
+    builds the pull request's test-merge commit M on base tip T. The pull
+    request is then squash-merged, so main moves to S, a child of T that M
+    does not contain. The job checks out M with full history, and the action
+    as shipped then ran `git fetch origin main --depth=1`. That fetch made S
+    a history boundary, S and M shared no visible commit, and
+    `git diff origin/main...HEAD` died with "no merge base" before a single
+    line was scanned.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls._tmp.cleanup)
+        cls.tmp = Path(cls._tmp.name).resolve()
+        up = cls.tmp / "upstream"
+        up.mkdir()
+        git_out(up, "init", "-q", "-b", "main")
+        git_out(up, "config", "user.email", "test@example.com")
+        git_out(up, "config", "user.name", "test")
+        notes = up / "notes.txt"
+        notes.write_text("first line\n", encoding="utf-8")
+        git_out(up, "add", "notes.txt")
+        git_out(up, "commit", "-qm", "T0")
+        with notes.open("a", encoding="utf-8") as f:
+            f.write("second line\n")
+        git_out(up, "commit", "-qam", "T")
+        cls.base_tip = git_out(up, "rev-parse", "HEAD")
+
+        git_out(up, "checkout", "-q", "-b", "feature")
+        with notes.open("a", encoding="utf-8") as f:
+            f.write("internal host " + "10.20.30.40" + "\n")
+        git_out(up, "commit", "-qam", "H")
+        cls.pr_head = git_out(up, "rev-parse", "HEAD")
+
+        # GitHub's test-merge commit: first parent T, second parent H.
+        git_out(up, "checkout", "-q", "--detach", cls.base_tip)
+        git_out(up, "merge", "-q", "--no-ff", "-m", "M", cls.pr_head)
+        cls.merge = git_out(up, "rev-parse", "HEAD")
+        git_out(up, "update-ref", "refs/pull/1/merge", cls.merge)
+
+        # The pull request lands as a squash commit, so main moves on to S.
+        git_out(up, "checkout", "-q", "main")
+        git_out(up, "merge", "-q", "--squash", cls.pr_head)
+        git_out(up, "commit", "-qm", "S")
+        cls.url = up.as_uri()
+
+    def checkout(self, depth: int | None = None) -> str:
+        """Check out M in a fresh clone, the way actions/checkout does."""
+        runner = Path(tempfile.mkdtemp(dir=self.tmp))
+        git_out(runner, "init", "-q")
+        git_out(runner, "remote", "add", "origin", self.url)
+        refspecs = [f"+{self.merge}:refs/remotes/pull/1/merge"]
+        depth_args = []
+        if depth is None:  # fetch-depth: 0 also fetches every branch
+            refspecs.insert(0, "+refs/heads/*:refs/remotes/origin/*")
+        else:
+            depth_args = [f"--depth={depth}"]
+        git_out(runner, "fetch", "-q", "--no-tags", *depth_args, "origin", *refspecs)
+        git_out(runner, "checkout", "-q", "--detach", "refs/remotes/pull/1/merge")
+        return str(runner)
+
+    @staticmethod
+    def shipped_refetch(runner: str) -> None:
+        """The action's old fetch step, which grafted the moved base."""
+        git_out(runner, "fetch", "-q", "origin", "main", "--depth=1")
+
+    def test_fixture_reproduces_the_no_merge_base_failure(self):
+        runner = self.checkout()
+        self.shipped_refetch(runner)
+        old = subprocess.run(
+            ["git", "-C", runner, "diff", "--unified=0", "origin/main...HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(old.returncode, 128, old.stderr)
+
+    def test_pr_head_diffs_the_merge_commit_against_its_first_parent(self):
+        runner = self.checkout()
+        git_out(runner, "fetch", "-q", "--no-tags", "origin", "main")
+        frm, to, how = rc.resolve_diff_range("origin/main", runner, self.pr_head)
+        self.assertEqual((frm, to), (self.base_tip, self.merge))
+        self.assertIn("test-merge commit", how)
+
+    def test_pr_head_survives_the_shipped_shallow_refetch(self):
+        runner = self.checkout()
+        self.shipped_refetch(runner)
+        diff = rc.get_diff_via_git("origin/main", runner, self.pr_head)
+        findings = rc.scan_added_lines(diff)
+        self.assertEqual([f.label for f in findings], ["private/link-local IP"])
+
+    def test_full_depth_refetch_keeps_the_merge_base(self):
+        runner = self.checkout()
+        git_out(runner, "fetch", "-q", "--no-tags", "origin", "main")
+        frm, to, _how = rc.resolve_diff_range("origin/main", runner)
+        self.assertEqual((frm, to), (self.base_tip, self.merge))
+
+    def test_shallow_checkout_is_deepened_to_reach_the_first_parent(self):
+        runner = self.checkout(depth=1)
+        self.assertEqual(
+            git_out(runner, "rev-parse", "--is-shallow-repository"), "true"
+        )
+        diff = rc.get_diff_via_git("origin/main", runner, self.pr_head)
+        findings = rc.scan_added_lines(diff)
+        self.assertEqual([f.label for f in findings], ["private/link-local IP"])
+
+    def test_first_parent_that_cannot_be_fetched_is_a_clear_error(self):
+        runner = self.checkout(depth=1)
+        git_out(runner, "remote", "set-url", "origin", (self.tmp / "gone").as_uri())
+        with self.assertRaises(rc.DiffError) as ctx:
+            rc.resolve_diff_range("origin/main", runner, self.pr_head)
+        self.assertIn("first parent", str(ctx.exception))
+
+    def test_no_merge_base_is_a_clear_error(self):
+        runner = self.checkout()
+        self.shipped_refetch(runner)
+        with self.assertRaises(rc.DiffError) as ctx:
+            rc.resolve_diff_range("origin/main", runner)
+        self.assertIn("no merge base", str(ctx.exception))
+        self.assertIn("fetch-depth: 0", str(ctx.exception))
+
+    def test_missing_base_is_a_clear_error(self):
+        runner = self.checkout(depth=1)  # fetches the merge ref only
+        with self.assertRaises(rc.DiffError) as ctx:
+            rc.resolve_diff_range("origin/main", runner)
+        self.assertIn("does not name a commit", str(ctx.exception))
+
+    def test_head_that_does_not_merge_pr_head_falls_back_to_the_merge_base(self):
+        # A caller that checks out the pull request head itself, not the
+        # merge ref, still gets the pull request's changes.
+        runner = self.checkout()
+        git_out(runner, "checkout", "-q", "--detach", self.pr_head)
+        frm, to, how = rc.resolve_diff_range("origin/main", runner, self.pr_head)
+        self.assertEqual((frm, to), (self.base_tip, self.pr_head))
+        self.assertIn("merge base", how)
+
+    def test_cli_scans_the_pull_request_after_the_base_moved(self):
+        runner = self.checkout()
+        self.shipped_refetch(runner)
+        argv = ["--base", "origin/main", "--root", runner, "--pr-head", self.pr_head]
+        code, out, _err = run_main(argv)
+        self.assertEqual(code, 1)
+        self.assertIn("Scanning lines added in", out)
+        self.assertIn("private/link-local IP", out)
+
+    def test_cli_never_passes_when_the_diff_cannot_be_computed(self):
+        runner = self.checkout()
+        self.shipped_refetch(runner)
+        for fail_on in ["match", "none"]:
+            with self.subTest(fail_on=fail_on):
+                argv = ["--base", "origin/main", "--root", runner, "--fail-on", fail_on]
+                code, out, _err = run_main(argv)
+                self.assertEqual(code, 2)
+                self.assertIn("::error::", out)
+                self.assertNotIn("clean", out)
+
+    def test_cli_says_so_when_the_range_is_empty(self):
+        runner = self.checkout()
+        code, out, _err = run_main(["--base", "HEAD", "--root", runner])
+        self.assertEqual(code, 0)
+        self.assertIn("::notice::", out)
+
+    def test_cli_pr_head_needs_base(self):
+        with self.assertRaises(SystemExit) as ctx:
+            run_main(["--pr-head", self.pr_head])
+        self.assertEqual(ctx.exception.code, 2)
+
+
+class ActionDefinitionTests(unittest.TestCase):
+    """These tests never run action.yml's shell step, so guard its key lines."""
+
+    @classmethod
+    def setUpClass(cls):
+        text = (THIS_DIR / "action.yml").read_text(encoding="utf-8")
+        cls.code = [ln for ln in text.splitlines() if not ln.strip().startswith("#")]
+
+    def test_the_base_is_never_fetched_shallow(self):
+        # A --depth fetch into the full clone is what grafted a moved base.
+        # MovedBaseTests reproduces it.
+        self.assertEqual([ln for ln in self.code if "--depth" in ln], [])
+
+    def test_the_pull_request_head_reaches_the_scanner(self):
+        self.assertTrue(
+            any("github.event.pull_request.head.sha" in ln for ln in self.code)
+        )
+        self.assertTrue(any("--pr-head" in ln for ln in self.code))
 
 
 class SelftestTests(unittest.TestCase):

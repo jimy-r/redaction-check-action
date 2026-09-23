@@ -20,8 +20,9 @@ inputs:
   fail-on:
     description: >-
       'match' (default) fails the step when any finding is reported. 'none'
-      always exits 0 and reports findings as warning annotations instead --
-      use this while first rolling the gate out on an existing repo.
+      reports findings as warning annotations without failing the step --
+      use this while first rolling the gate out on an existing repo. A diff
+      that cannot be computed fails the step under either setting.
     required: false
     default: match
   scan-mode:
@@ -35,7 +36,10 @@ inputs:
     description: >-
       Branch or ref to diff against in added-lines mode. Defaults to the
       pull request's base branch (github.base_ref). Set this explicitly
-      when triggering on an event other than pull_request.
+      when triggering on an event other than pull_request. On a
+      pull_request event against that same base, the scan diffs GitHub's
+      test-merge commit against its own first parent instead, so a base
+      branch that moves while the check is queued cannot break it.
     required: false
     default: ''
 
@@ -54,6 +58,8 @@ runs:
         FAIL_ON: ${{ inputs.fail-on }}
         SCAN_MODE: ${{ inputs.scan-mode }}
         BASE_REF: ${{ inputs.base-ref || github.base_ref }}
+        PR_BASE_REF: ${{ github.base_ref }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       run: |
         set -euo pipefail
         args=(--fail-on "$FAIL_ON")
@@ -68,10 +74,21 @@ runs:
             echo "::error::scan-mode is added-lines but no base ref is available. Set the base-ref input, or trigger this action on pull_request."
             exit 1
           fi
-          # A failed fetch (e.g. the ref already exists locally with
-          # fetch-depth: 0) is not fatal -- the diff below is what matters.
-          git fetch origin "$BASE_REF" --depth=1 || true
-          git diff --unified=0 "origin/$BASE_REF...HEAD" > "$RUNNER_TEMP/redaction-check.diff"
+          # Full-depth fetch only. A shallow fetch into the checkout's full
+          # clone marks the fetched tip as a history boundary. Once the base
+          # has moved past the pull request's merge commit, that tip shares no
+          # visible history with HEAD and there is no merge base to diff from.
+          # A failed fetch still leaves the checkout's own origin/<base-ref>,
+          # and the scanner fails loudly if that is missing too.
+          if ! git fetch --no-tags origin "$BASE_REF"; then
+            echo "::warning::Could not fetch $BASE_REF from origin. Diffing against the checkout's own copy of it."
+          fi
+          # On a pull_request event the checkout is GitHub's test-merge commit.
+          # Given the head SHA, the scanner diffs that commit against its own
+          # first parent, which needs no merge base with the base branch.
+          if [ -n "$PR_HEAD_SHA" ] && [ "$BASE_REF" = "$PR_BASE_REF" ]; then
+            args+=(--pr-head "$PR_HEAD_SHA")
+          fi
           python "${{ github.action_path }}/redaction_check.py" --mode added-lines \
-            --diff-file "$RUNNER_TEMP/redaction-check.diff" "${args[@]}"
+            --base "origin/$BASE_REF" "${args[@]}"
         fi

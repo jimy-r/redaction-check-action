@@ -13,12 +13,16 @@ the raw substring), so the gate's own output -- which lands in a CI log that
 may be public -- cannot itself leak the thing it caught.
 
 Exit 0 = clean (or findings under --fail-on none). Exit 1 = findings and
---fail-on match (the default). A genuine false positive: mark the specific
-line with a `redaction-ok` comment, or override on merge.
+--fail-on match (the default). Exit 2 = --base was given and the diff to
+scan could not be computed, which is never a pass, whatever --fail-on says.
+A genuine false positive: mark the specific line with a `redaction-ok`
+comment, or override on merge.
 
 Usage:
     python redaction_check.py --diff-file changes.diff
     git diff --unified=0 origin/main...HEAD | python redaction_check.py
+    python redaction_check.py --base origin/main
+    python redaction_check.py --base origin/main --pr-head <sha>  # PR merge ref
     python redaction_check.py --mode all-files --root .
     python redaction_check.py --selftest
 """
@@ -310,15 +314,128 @@ def parse_added_lines(diff_text: str) -> Iterator[tuple[str, int, str]]:
 # is scanned, so the gate fails closed on content it never looked at. Git emits
 # UTF-8; decode it as UTF-8 and replace anything undecodable, because a mangled
 # character in a diff line is still scannable and a crash is not.
-def get_diff_via_git(base: str, root: str = ".") -> str:
+def _git(root: str, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["git", "-C", root, "diff", "--unified=0", f"{base}...HEAD"],
+        ["git", "-C", root, *args],
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
-        check=True,
-    ).stdout
+        check=False,
+    )
+
+
+def _last_error_line(result: subprocess.CompletedProcess[str]) -> str:
+    lines = result.stderr.strip().splitlines()
+    return lines[-1] if lines else f"git exited with status {result.returncode}"
+
+
+class DiffError(Exception):
+    """The diff to scan could not be computed. Never a pass, whatever --fail-on says."""
+
+
+def commit_parents(rev: str, root: str = ".") -> list[str]:
+    """Return the parent SHAs recorded in a commit object, first parent first.
+
+    Read from the object itself because a shallow clone hides a boundary
+    commit's parents from `rev-parse <rev>^1` and from `%P`, while the object
+    still names them.
+    """
+    result = _git(root, "cat-file", "commit", rev)
+    if result.returncode != 0:
+        raise DiffError(f"cannot read commit {rev}: {_last_error_line(result)}")
+    parents = []
+    for line in result.stdout.splitlines():
+        if not line:
+            break  # end of the header; a message line may start with "parent "
+        if line.startswith("parent "):
+            parents.append(line.removeprefix("parent "))
+    return parents
+
+
+def _has_commit(rev: str, root: str) -> bool:
+    return _git(root, "cat-file", "-e", f"{rev}^{{commit}}").returncode == 0
+
+
+def resolve_diff_range(
+    base: str, root: str = ".", pr_head: str | None = None
+) -> tuple[str, str, str]:
+    """Return (from_commit, to_commit, how) spanning the lines HEAD adds.
+
+    With pr_head set, and HEAD being GitHub's test-merge commit for it (first
+    parent: the base commit the merge was built on, second parent: pr_head),
+    the range is HEAD's first parent to HEAD. That is the pull request's own
+    change, and it needs no merge base with the base branch's current tip, so
+    a base that moves while the check is queued cannot break it. A shallow
+    checkout that lacks the first parent is deepened by one commit from
+    origin.
+
+    Otherwise the range starts at the merge base of base and HEAD, which is
+    what `git diff base...HEAD` shows. Raises DiffError, with the reason, when
+    the range cannot be computed.
+    """
+    head = _git(root, "rev-parse", "--verify", "HEAD^{commit}")
+    if head.returncode != 0:
+        raise DiffError(f"HEAD does not name a commit: {_last_error_line(head)}")
+    head_sha = head.stdout.strip()
+
+    how = f"HEAD against its merge base with {base}"
+    if pr_head:
+        parents = commit_parents(head_sha, root)
+        if len(parents) == 2 and parents[1] == pr_head.strip().lower():
+            first_parent = parents[0]
+            if not _has_commit(first_parent, root):
+                fetch = _git(
+                    root, "fetch", "--no-tags", "--deepen=1", "origin", head_sha
+                )
+                if not _has_commit(first_parent, root):
+                    detail = (
+                        _last_error_line(fetch)
+                        if fetch.returncode
+                        else "the fetch ran but did not bring it in"
+                    )
+                    raise DiffError(
+                        f"HEAD is the test-merge commit for {pr_head[:12]}, but its "
+                        f"first parent {first_parent[:12]} is not in this clone and "
+                        f"deepening the fetch from origin failed ({detail})."
+                    )
+            how = "the pull request's test-merge commit against its first parent"
+            return first_parent, head_sha, how
+        how += f", since HEAD does not merge pull request head {pr_head[:12]}"
+
+    base_commit = _git(root, "rev-parse", "--verify", f"{base}^{{commit}}")
+    if base_commit.returncode != 0:
+        raise DiffError(
+            f"{base} does not name a commit in this clone. Check out with "
+            "fetch-depth: 0 so the base branch's history is present."
+        )
+    merge_base = _git(root, "merge-base", base_commit.stdout.strip(), head_sha)
+    if merge_base.returncode != 0:
+        shallow = _git(root, "rev-parse", "--is-shallow-repository").stdout.strip()
+        hint = (
+            " This clone is shallow, which hides the history they share. Check "
+            "out with fetch-depth: 0, and never re-fetch the base with --depth."
+            if shallow == "true"
+            else " Their histories share no commit."
+        )
+        raise DiffError(
+            f"{base} and HEAD have no merge base, so the lines HEAD adds cannot "
+            f"be worked out.{hint}"
+        )
+    return merge_base.stdout.strip(), head_sha, how
+
+
+def git_diff(from_commit: str, to_commit: str, root: str = ".") -> str:
+    result = _git(root, "diff", "--unified=0", from_commit, to_commit)
+    if result.returncode != 0:
+        raise DiffError(f"git diff failed: {_last_error_line(result)}")
+    return result.stdout
+
+
+def get_diff_via_git(base: str, root: str = ".", pr_head: str | None = None) -> str:
+    """Return the --unified=0 diff of the lines HEAD adds; see resolve_diff_range."""
+    from_commit, to_commit, _how = resolve_diff_range(base, root, pr_head)
+    return git_diff(from_commit, to_commit, root)
 
 
 def iter_tracked_files(root: str = ".") -> Iterator[str]:
@@ -473,13 +590,21 @@ def main(argv: list[str] | None = None) -> int:
         help="if set, added-lines mode runs `git diff --unified=0 <base>...HEAD` itself "
         "instead of reading --diff-file/stdin",
     )
+    ap.add_argument(
+        "--pr-head",
+        metavar="SHA",
+        help="with --base: the pull request's head commit (full SHA). When HEAD is "
+        "the test-merge commit that merges it, the diff is HEAD against its own "
+        "first parent, which needs no merge base with a base branch that has moved",
+    )
     ap.add_argument("--root", default=".", help="repo root for all-files mode / --base")
     ap.add_argument("--patterns-file", help="extra denylist file: one regex per line")
     ap.add_argument(
         "--fail-on",
         choices=["match", "none"],
         default="match",
-        help="match (default) exits 1 on any finding; none always exits 0 (report only)",
+        help="match (default) exits 1 on any finding; none reports findings "
+        "without failing on them",
     )
     ap.add_argument(
         "--selftest",
@@ -487,6 +612,8 @@ def main(argv: list[str] | None = None) -> int:
         help="run built-in pattern assertions and exit",
     )
     args = ap.parse_args(argv)
+    if args.pr_head and not args.base:
+        ap.error("--pr-head needs --base, the fallback when HEAD is not a merge ref")
 
     if args.selftest:
         return run_selftest()
@@ -499,7 +626,21 @@ def main(argv: list[str] | None = None) -> int:
         findings = scan_all_files(args.root, extra_patterns)
     else:
         if args.base:
-            diff_text = get_diff_via_git(args.base, args.root)
+            try:
+                from_commit, to_commit, how = resolve_diff_range(
+                    args.base, args.root, args.pr_head
+                )
+                diff_text = git_diff(from_commit, to_commit, args.root)
+            except DiffError as exc:
+                print(f"::error::Redaction gate cannot compute the diff to scan. {exc}")
+                return 2
+            print(
+                f"Scanning lines added in {from_commit[:12]}..{to_commit[:12]} ({how})."
+            )
+            if not diff_text.strip():
+                print(
+                    "::notice::That range has no changes, so there was nothing to scan."
+                )
         elif args.diff_file and args.diff_file != "-":
             with open(args.diff_file, encoding="utf-8", errors="replace") as f:
                 diff_text = f.read()

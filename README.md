@@ -35,7 +35,7 @@ jobs:
       - uses: jimy-r/redaction-check-action@v1
 ```
 
-`fetch-depth: 0` is required. The default shallow checkout doesn't include the base branch, so added-lines mode has nothing to diff against without it. The action sets up its own Python, so there's nothing else for the caller to install.
+`fetch-depth: 0` is required. The default shallow checkout doesn't include the base branch, so added-lines mode has nothing to diff against without it. On a `pull_request` event the scan diffs GitHub's test-merge commit against its own first parent, the base commit that merge was built on, so a base branch that moves while the check is queued can't break it. If the diff can't be computed at all, the step fails with an error rather than passing. The action sets up its own Python, so there's nothing else for the caller to install.
 
 `@v1` is a moving major tag, repointed at the newest `v1.x.y` on every release; it is not re-tagged for patch or minor bumps you'd need to review individually. Pin to a specific tag (`@v1.2.3`) or commit SHA instead if you want releases to land on your own schedule.
 
@@ -44,7 +44,7 @@ jobs:
 | Input | Default | Meaning |
 |---|---|---|
 | `patterns-file` | *(none)* | Path to an extra denylist, one regular expression per line. `#` comments and blank lines are skipped. |
-| `fail-on` | `match` | `match` fails the step on any finding. `none` always exits 0 and reports findings as warnings instead, useful while first rolling the gate out on an existing repo. |
+| `fail-on` | `match` | `match` fails the step on any finding. `none` reports findings as warnings without failing on them, useful while first rolling the gate out on an existing repo. A diff that can't be computed fails the step either way. |
 | `scan-mode` | `added-lines` | `added-lines` scans only what the PR adds. `all-files` walks every git-tracked file instead, for a full-repo audit run. |
 | `base-ref` | *(auto)* | Branch to diff against. Defaults to the pull request's base branch. Set it explicitly when triggering on an event other than `pull_request`. |
 
