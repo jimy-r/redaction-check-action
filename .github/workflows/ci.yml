@@ -42,13 +42,16 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Add a fixture commit on top of main with a detectable shape
+      - name: Add a fixture commit on top of the checkout with a detectable shape
         shell: bash
         run: |
           set -euo pipefail
           git config user.email "ci@example.invalid"
           git config user.name "redaction-check self-test"
-          git checkout -b self-test-fixture origin/main
+          # Build on the checked-out commit, not origin/main. On a pull_request
+          # event the action refuses a checkout that does not contain the pull
+          # request's head, so a fixture on origin/main would exit 2.
+          git checkout -b self-test-fixture
           mkdir -p .fixture
           {
             echo "This line is clean."
