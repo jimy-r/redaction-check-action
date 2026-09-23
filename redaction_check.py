@@ -137,14 +137,16 @@ PRIVATE_IPV4_RE = re.compile(
 # use it), not information about anyone's network -- allow it through.
 IP_ALLOW = {"169.254.169.254"}
 
-# mDNS-style local hostnames (e.g. jamespc.local) often carry a real device
+# mDNS-style local hostnames (e.g. devbox.local) often carry a real device
 # or user name. Same placeholder logic as the home-path check, plus a few
-# generic words common in networking docs. An mDNS name ends at `.local`, so
-# the lookahead skips a `.local.` segment inside a filename such as
-# settings.local.json or docker-compose.local.yml. A sentence-final
-# `host.local.` still matches, because nothing follows that dot.
+# generic words common in networking docs. The lookahead exempts a `.local.`
+# segment only before a config-file extension, the per-machine config
+# convention (settings.local.json, docker-compose.local.yml). A host named
+# inside any other file name (devbox.local.pem, devbox.local.conf, a log
+# named user@devbox.local.log) and a sentence-final `host.local.` still match.
 LOCAL_HOSTNAME_RE = re.compile(
-    r"\b([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)\.local\b(?!\.[A-Za-z0-9])"
+    r"\b([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)\.local\b"
+    r"(?!\.(?:json|ya?ml|toml|ini|env|js|ts|xml|properties)\b)"
 )
 HOSTNAME_PLACEHOLDERS = PATH_PLACEHOLDERS | {
     "test",
@@ -588,6 +590,7 @@ def run_selftest() -> int:
         "internal host at 192.168" + ".1.42",
         "reachable at build7" + ".local on the LAN",
         "the share lives on build7" + ".local.",
+        "ssl_certificate /etc/ssl/build7" + ".local.pem;",
     ]
     must_pass = [
         "see /home/alice/project for the example",

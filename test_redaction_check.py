@@ -215,22 +215,41 @@ class LocalHostnameTests(unittest.TestCase):
     def test_localhost_local_is_allowed(self):
         self.assertEqual(rc.scan_line("bind to localhost.local in dev"), [])
 
-    def test_local_segment_inside_a_filename_is_not_a_hostname(self):
-        # An mDNS name ends at .local, so a further dotted part is a file
-        # extension. Claude Code's per-user settings.local.json was the
-        # false positive that forced a redaction-ok marker onto real docs.
+    def test_local_segment_before_a_config_extension_is_not_a_hostname(self):
+        # Claude Code's per-user settings.local.json was the false positive
+        # that forced a redaction-ok marker onto real docs. Every config
+        # extension the lookahead exempts is covered here.
         for name in [
             "settings.local.json",
             ".claude/settings.local.json",
             "docker-compose.local.yml",
+            "compose.local.yaml",
             "config.local.toml",
+            "php.local.ini",
+            "compose.local.env",
+            "webpack.local.js",
+            "vite.local.ts",
+            "logback.local.xml",
+            "application.local.properties",
         ]:
             with self.subTest(name=name):
                 self.assertEqual(rc.scan_line(f"copy {name} over the defaults"), [])
 
+    def test_host_inside_any_other_file_name_is_flagged(self):
+        # A certificate, a vhost file or a log named after the machine
+        # carries its hostname. Only config extensions are exempt.
+        for line in [
+            "ssl_certificate /etc/ssl/" + "devbox.local" + ".pem;",
+            "include sites-enabled/" + "devbox.local" + ".conf;",
+            "tail /var/log/app/user@" + "devbox.local" + ".log",
+        ]:
+            with self.subTest(line=line):
+                labels = [label for label, _ in rc.scan_line(line)]
+                self.assertIn("mDNS/.local hostname", labels)
+
     def test_hostname_followed_by_punctuation_is_still_flagged(self):
-        # The lookahead only skips `.local.` when the dot is followed by a
-        # letter or digit, so a full stop or a port does not hide a host.
+        # The lookahead only skips `.local.` before a config extension, so
+        # a full stop or a port does not hide a host.
         for line in [
             "the share lives on " + "build7.local" + ".",
             "the share lives on " + "build7.local" + ". Mount it first.",
