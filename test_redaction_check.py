@@ -699,6 +699,16 @@ class ScanAddedLinesTests(unittest.TestCase):
         )
         self.assertEqual(rc.scan_added_lines(diff), [])
 
+    def test_added_paths_get_the_filename_check_once(self):
+        diff = (
+            "diff --git a/.env b/.env\n--- /dev/null\n+++ b/.env\n@@ -0,0 +1 @@\n+K=v\n"
+        )
+        added = [".env", "keys/id_rsa", "notes.txt", "redaction_check.py"]
+        found = [(f.path, f.label) for f in rc.scan_added_lines(diff, (), added)]
+        self.assertEqual(
+            found, [(".env", "dotenv file"), ("keys/id_rsa", "SSH private key file")]
+        )
+
     def test_clean_diff_produces_no_findings(self):
         diff = (
             "diff --git a/f.txt b/f.txt\n"
@@ -1327,6 +1337,79 @@ class GitDiffTests(unittest.TestCase):
         self.assertEqual(
             sorted(found),
             [("café/.env", "dotenv file"), ("my dir/.env", "dotenv file")],
+        )
+
+    def test_secret_file_that_adds_no_diff_line_is_flagged_by_name(self):
+        # A binary file, an empty file and a pure rename show no added line,
+        # so their names never reached the filename check.
+        self.repo.write("config.txt", b"K=v\n")
+        self.repo.commit("a tracked file")
+        self.repo.write("client.p12", b"0\x82\x0a\x00\x02\x01\x03")
+        self.repo.write("empty/.env", b"")
+        git_out(self.repo.path, "mv", "config.txt", ".env.production")
+        self.repo.commit("add")
+        code, found = self.repo.scan()
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            sorted(found),
+            [
+                (".env.production", "dotenv file"),
+                ("client.p12", "key/cert file"),
+                ("empty/.env", "dotenv file"),
+            ],
+        )
+
+    def test_text_that_git_would_call_binary_is_scanned(self):
+        # A NUL byte, or a `-diff` attribute the change adds itself, made git
+        # print "Binary files differ" in place of the lines.
+        self.repo.write("notes.txt", b"x\x00\nhost " + IP.encode() + b"\n")
+        self.repo.write(".gitattributes", b"*.log -diff\n")
+        self.repo.write("app.log", f"host {IP}\n".encode())
+        self.repo.commit("add")
+        code, found = self.repo.scan()
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            sorted(found),
+            [
+                ("app.log", "private/link-local IP"),
+                ("notes.txt", "private/link-local IP"),
+            ],
+        )
+
+    def test_runner_diff_filters_cannot_rewrite_the_diff(self):
+        # A textconv filter or a diff.external command in the runner's git
+        # config replaced git's own output. `true` prints nothing at all.
+        self.repo.write(".gitattributes", b"*.cfg diff=conv\n")
+        self.repo.write("a.cfg", f"host {IP}\n".encode())
+        self.repo.commit("add")
+        for key in ["diff.conv.textconv", "diff.external"]:
+            with self.subTest(config=key):
+                git_out(self.repo.path, "config", key, "true")
+                code, found = self.repo.scan()
+                git_out(self.repo.path, "config", "--unset", key)
+                self.assertEqual(code, 1)
+                self.assertEqual(found, [("a.cfg", "private/link-local IP")])
+
+    def test_binary_media_is_checked_by_name_not_content(self):
+        # --text prints any binary as lines. Real fonts, images, archives and
+        # media carry email- and path-shaped byte runs, so their content is
+        # skipped. Other binaries are still read, and a secret name counts.
+        payload = b"\x00\x01\x00\x00 host " + IP.encode() + b" \x00\xff\n"
+        for name in [
+            "logo.png",
+            "Font.TTF",
+            "bundle.tar.gz",
+            "demo.webm",
+            "backup/.env.zip",
+            "blob.bin",
+        ]:
+            self.repo.write(name, payload)
+        self.repo.commit("add")
+        code, found = self.repo.scan()
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            sorted(found),
+            [("backup/.env.zip", "dotenv file"), ("blob.bin", "private/link-local IP")],
         )
 
     def test_file_whose_line_looks_like_a_header_is_scanned(self):

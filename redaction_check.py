@@ -182,6 +182,25 @@ SECRET_FILENAME_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("secrets file", re.compile(r"^secrets\.(ya?ml|json|toml)$", re.IGNORECASE)),
 ]
 
+# Binary media. The diff runs with --text, so a NUL byte or a `-diff`
+# attribute cannot hide a text file's content, and that prints these files as
+# lines too. Real ones are full of email- and path-shaped byte runs (read as
+# text, 202 of a sample of 336 system fonts produced a finding), so their
+# content is skipped. Their names are still checked.
+BINARY_EXTENSIONS = frozenset(
+    (
+        "png jpg jpeg gif bmp ico icns webp tif tiff avif heic heif"  # images
+        " ttf otf ttc woff woff2 eot"  # fonts
+        " zip gz tgz bz2 xz zst 7z rar tar jar whl"  # archives
+        " mp3 m4a ogg wav flac mp4 m4v mov webm avi mkv"  # audio and video
+    ).split()
+)
+
+
+def has_binary_extension(path: str) -> bool:
+    basename = path.rsplit("/", 1)[-1]
+    return "." in basename and basename.rsplit(".", 1)[1].lower() in BINARY_EXTENSIONS
+
 
 @dataclass(frozen=True)
 class Finding:
@@ -553,12 +572,19 @@ def git_diff(from_commit: str, to_commit: str, root: str = ".") -> str:
     # --no-color: a runner's color.ui=always would otherwise put escape codes
     # in front of every line, and the parser would recognise none of them.
     # core.quotePath=false: a non-ASCII path prints as itself, not quoted.
+    # --text: a NUL byte or a `-diff` attribute made git print "Binary files
+    # differ" for a text file, and its lines were never scanned.
+    # --no-ext-diff, --no-textconv: a diff.external command or a textconv
+    # filter from the runner's config could rewrite the diff, or blank it.
     result = _git(
         root,
         "-c",
         "core.quotePath=false",
         "diff",
         "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--text",
         "--unified=0",
         from_commit,
         to_commit,
@@ -566,6 +592,29 @@ def git_diff(from_commit: str, to_commit: str, root: str = ".") -> str:
     if result.returncode != 0:
         raise DiffError(f"git diff failed: {_last_error_line(result)}")
     return _text(result.stdout)
+
+
+def git_added_paths(from_commit: str, to_commit: str, root: str = ".") -> list[str]:
+    """Return every path the range adds, or renames or copies a file to.
+
+    Asked of git directly, because a binary file, an empty file and a pure
+    rename add no line for the diff parser to take a name from. C is in the
+    filter with A and R because diff.renames=copies reports a copy as C.
+    """
+    result = _git(
+        root,
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--name-only",
+        "-z",
+        "--diff-filter=ACR",
+        from_commit,
+        to_commit,
+    )
+    if result.returncode != 0:
+        raise DiffError(f"git diff --name-only failed: {_last_error_line(result)}")
+    return [name for name in _text(result.stdout).split("\0") if name]
 
 
 def get_diff_via_git(base: str, root: str = ".", pr_head: str | None = None) -> str:
@@ -592,8 +641,16 @@ def iter_tracked_files(root: str = ".") -> Iterator[str]:
 
 
 def scan_added_lines(
-    diff_text: str, extra_patterns: Iterable[tuple[str, re.Pattern[str]]] = ()
+    diff_text: str,
+    extra_patterns: Iterable[tuple[str, re.Pattern[str]]] = (),
+    added_paths: Iterable[str] = (),
 ) -> list[Finding]:
+    """Scan a diff's added lines, and the name of each file it adds to.
+
+    added_paths (see git_added_paths) names the files the range adds or
+    renames. Each gets the filename check even when the diff shows no line
+    for it, as with a binary file, an empty file or a pure rename.
+    """
     findings: list[Finding] = []
     seen_paths: set[str] = set()
     for path, lineno, text in parse_added_lines(diff_text):
@@ -604,8 +661,17 @@ def scan_added_lines(
             label = check_filename(path)
             if label:
                 findings.append(Finding(path, lineno, label, mask(path)))
+        if has_binary_extension(path):
+            continue
         for hit_label, matched in scan_line(text, extra_patterns):
             findings.append(Finding(path, lineno, hit_label, mask(matched)))
+    for path in added_paths:
+        if path in SELF_PATHS or path in seen_paths:
+            continue
+        seen_paths.add(path)
+        label = check_filename(path)
+        if label:
+            findings.append(Finding(path, 1, label, mask(path)))
     return findings
 
 
@@ -760,12 +826,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "all-files":
         findings = scan_all_files(args.root, extra_patterns)
     else:
+        added_paths: list[str] = []
         if args.base:
             try:
                 from_commit, to_commit, how = resolve_diff_range(
                     args.base, args.root, args.pr_head
                 )
                 diff_text = git_diff(from_commit, to_commit, args.root)
+                added_paths = git_added_paths(from_commit, to_commit, args.root)
             except DiffError as exc:
                 print(f"::error::Redaction gate cannot compute the diff to scan. {exc}")
                 return 2
@@ -784,7 +852,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             stdin_bytes = getattr(sys.stdin, "buffer", None)
             diff_text = _text(stdin_bytes.read()) if stdin_bytes else sys.stdin.read()
-        findings = scan_added_lines(diff_text, extra_patterns)
+        findings = scan_added_lines(diff_text, extra_patterns, added_paths)
 
     return report(findings, args.fail_on)
 
