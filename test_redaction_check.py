@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -336,6 +337,21 @@ class SecretFilenameTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Suppression marker
 # ---------------------------------------------------------------------------
+
+
+class MediaSignatureTests(unittest.TestCase):
+    def test_media_needs_its_format_s_leading_bytes(self):
+        self.assertTrue(rc.is_media("img/logo.PNG", b"\x89PNG\r\n\x1a\n\x00\x00"))
+        self.assertTrue(rc.is_media("clip.mp4", b"\x00\x00\x00\x20ftypisom"))
+        self.assertTrue(rc.is_media("song.wav", b"RIFF\x24\x08\x00\x00WAVEfmt "))
+        self.assertFalse(rc.is_media("notes.png", b"host " + IP.encode()))
+        self.assertFalse(rc.is_media("song.wav", b"RIFF\x24\x08\x00\x00AVI "))
+        self.assertFalse(rc.is_media("logo.jpg", b"\x89PNG\r\n\x1a\n"))
+        self.assertFalse(rc.is_media("README", b"\x89PNG\r\n\x1a\n"))
+
+    def test_an_uncompressed_tar_is_never_media(self):
+        self.assertNotIn("tar", rc.MEDIA_RE)
+        self.assertFalse(rc.is_media("backup.tar", b"cfg/notes.txt\x00\x00"))
 
 
 class SuppressionMarkerTests(unittest.TestCase):
@@ -1477,17 +1493,18 @@ class GitDiffTests(unittest.TestCase):
     def test_binary_media_is_checked_by_name_not_content(self):
         # --text prints any binary as lines. Real fonts, images, archives and
         # media carry email- and path-shaped byte runs, so their content is
-        # skipped. Other binaries are still read, and a secret name counts.
-        payload = b"\x00\x01\x00\x00 host " + IP.encode() + b" \x00\xff\n"
-        for name in [
-            "logo.png",
-            "Font.TTF",
-            "bundle.tar.gz",
-            "demo.webm",
-            "backup/.env.zip",
-            "blob.bin",
+        # skipped when the file starts the way its format does. Other
+        # binaries are still read, and a secret name counts.
+        payload = b" host " + IP.encode() + b" \x00\xff\n"
+        for name, magic in [
+            ("logo.png", b"\x89PNG\r\n\x1a\n"),
+            ("Font.TTF", b"\x00\x01\x00\x00"),
+            ("bundle.tar.gz", b"\x1f\x8b\x08\x00"),
+            ("demo.webm", b"\x1a\x45\xdf\xa3"),
+            ("backup/.env.zip", b"PK\x03\x04"),
+            ("blob.bin", b"\x00\x01\x00\x00"),
         ]:
-            self.repo.write(name, payload)
+            self.repo.write(name, magic + payload)
         self.repo.commit("add")
         code, found = self.repo.scan()
         self.assertEqual(code, 1)
@@ -1495,6 +1512,45 @@ class GitDiffTests(unittest.TestCase):
             sorted(found),
             [("backup/.env.zip", "dotenv file"), ("blob.bin", "private/link-local IP")],
         )
+
+    def test_text_with_a_media_name_is_scanned(self):
+        # The name alone used to skip the content. A text file called
+        # notes.png is still text, and an uncompressed tar holds its member
+        # files byte for byte.
+        self.repo.write("notes.png", f"host {IP}\n".encode())
+        member = f"host {IP}\n".encode()
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w") as tar:
+            info = tarfile.TarInfo("cfg/notes.txt")
+            info.size = len(member)
+            tar.addfile(info, io.BytesIO(member))
+        self.repo.write("backup.tar", archive.getvalue())
+        self.repo.commit("add")
+        code, found = self.repo.scan()
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            sorted(found),
+            [
+                ("backup.tar", "private/link-local IP"),
+                ("notes.png", "private/link-local IP"),
+            ],
+        )
+
+    def test_each_commit_is_checked_for_media_as_that_commit_has_it(self):
+        # The net diff sees the real PNG the last commit left. The first
+        # commit's own notes.png was text, and that commit stays in history.
+        self.repo.write("notes.png", f"host {IP}\n".encode())
+        self.repo.commit("text named like an image")
+        leaking_commit = self.repo.head()
+        self.repo.write("notes.png", b"\x89PNG\r\n\x1a\n host " + IP.encode() + b"\n")
+        self.repo.commit("a real image")
+        code, out = self.repo.run_cli("HEAD~2")
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            COMMIT_FINDING_RE.findall(out),
+            [("notes.png", "private/link-local IP", leaking_commit[:12])],
+        )
+        self.assertEqual(len(FINDING_RE.findall(out)), 1)
 
     def test_file_whose_line_looks_like_a_header_is_scanned(self):
         self.repo.write("pp.txt", f"++ /dev/null\nhost {IP}\n".encode())
