@@ -972,6 +972,58 @@ class CLITests(unittest.TestCase):
         self.assertNotIn(b"Traceback", result.stderr)
 
 
+class WorkflowCommandTests(unittest.TestCase):
+    """Findings print as ::error lines the runner parses. Nothing may break out."""
+
+    def test_a_file_name_cannot_forge_workflow_commands(self):
+        # Git C-quotes a path that holds a newline, and the parser decodes it.
+        # Printed raw into file=, the rest of the name became lines of its
+        # own: a forged warning, then a stop-commands that silenced every
+        # real finding after it.
+        name = "odd\n::warning title=INJECTED::forged\n::stop-commands::tok\nname.txt"
+        quoted = '"b/' + name.replace("\n", "\\n") + '"'
+        diff = (
+            f"diff --git {quoted.replace('b/', 'a/', 1)} {quoted}\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            f"+++ {quoted}\n"
+            "@@ -0,0 +1 @@\n"
+            f"+host {IP}\n"
+        )
+        code, out, _err = run_main([], stdin_text=diff)
+        self.assertEqual(code, 1)
+        commands = [ln for ln in out.splitlines() if ln.startswith("::")]
+        self.assertEqual(len(commands), 1)
+        self.assertTrue(
+            commands[0].startswith(
+                "::error file=odd%0A%3A%3Awarning title=INJECTED%3A%3Aforged"
+                "%0A%3A%3Astop-commands%3A%3Atok%0Aname.txt,line=1::Possible "
+            ),
+            commands[0],
+        )
+
+    def test_a_custom_pattern_label_is_escaped_in_the_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            patterns = Path(tmp) / "patterns.txt"
+            patterns.write_text("TICKET%[0-9]+\n", encoding="utf-8")
+            diff = (
+                "diff --git a/n.txt b/n.txt\n"
+                "--- /dev/null\n"
+                "+++ b/n.txt\n"
+                "@@ -0,0 +1 @@\n"
+                "+see TICKET%42\n"
+            )
+            code, out, _err = run_main(
+                ["--patterns-file", str(patterns)], stdin_text=diff
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("::Possible custom pattern (TICKET%25[0-9]+): ", out)
+
+    def test_escaping_matches_the_actions_toolkit(self):
+        self.assertEqual(rc.command_data("50% done\r\nnext"), "50%25 done%0D%0Anext")
+        self.assertEqual(rc.command_property("a,b:c%\n.txt"), "a%2Cb%3Ac%25%0A.txt")
+
+
 class GitOutputEncodingTests(unittest.TestCase):
     """A diff carrying bytes outside the host codepage must not crash the gate.
 

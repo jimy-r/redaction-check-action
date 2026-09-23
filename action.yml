@@ -95,7 +95,10 @@ runs:
           # A failed fetch still leaves the checkout's own origin/<base-ref>,
           # and the scanner fails loudly if that is missing too.
           if ! git fetch --no-tags origin "$BASE_REF"; then
-            echo "::warning::Could not fetch $BASE_REF from origin. Diffing against the checkout's own copy of it."
+            # Escaped as @actions/core escapes a message, so the value cannot
+            # end this line and start a workflow command of its own.
+            ref=${BASE_REF//%/%25}; ref=${ref//$'\r'/%0D}; ref=${ref//$'\n'/%0A}
+            echo "::warning::Could not fetch $ref from origin. Diffing against the checkout's own copy of it."
           fi
           # A full commit SHA (github.event.before on a push) is the base as
           # it stands. Anything else names a branch on origin.

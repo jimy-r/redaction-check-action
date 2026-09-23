@@ -1043,24 +1043,41 @@ def run_selftest() -> int:
 # ---------------------------------------------------------------------------
 
 
+def command_data(text: str) -> str:
+    """Escape text for a workflow command's message, as @actions/core does.
+
+    A raw newline ends the command, and the runner reads whatever follows it
+    as a line of its own. A file name that carried one forged a warning and
+    a ::stop-commands::, which silenced every real finding after it.
+    """
+    return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def command_property(text: str) -> str:
+    """Escape text for a workflow command property, such as file=."""
+    return command_data(text).replace(":", "%3A").replace(",", "%2C")
+
+
 def report(findings: list[Finding], fail_on: str) -> int:
     level = "error" if fail_on == "match" else "warning"
     for f in findings:
         if f.commit:
-            print(
-                f"::{level} file={f.path},line={f.line}::"
+            message = (
                 f"Possible {f.label} added in commit {f.commit[:12]}: {f.masked} "
                 f"(masked, not the real value). A later commit that removes it "
                 f"leaves it in the branch's history, so rewrite the branch without "
                 f"it, or mark the line in that commit with `{SUPPRESS_MARKER}` if "
                 f"it is a deliberate placeholder."
             )
-            continue
+        else:
+            message = (
+                f"Possible {f.label}: {f.masked} (masked, not the real value). "
+                f"Generalise or remove before this can merge, or mark the line "
+                f"with `{SUPPRESS_MARKER}` if it is a deliberate placeholder."
+            )
         print(
-            f"::{level} file={f.path},line={f.line}::"
-            f"Possible {f.label}: {f.masked} (masked, not the real value). "
-            f"Generalise or remove before this can merge, or mark the line "
-            f"with `{SUPPRESS_MARKER}` if it is a deliberate placeholder."
+            f"::{level} file={command_property(f.path)},line={f.line}::"
+            f"{command_data(message)}"
         )
     if findings:
         print(
@@ -1158,7 +1175,8 @@ def main(argv: list[str] | None = None) -> int:
                     from_commit, to_commit, args.root, extra_patterns, skip_paths
                 )
             except DiffError as exc:
-                print(f"::error::Redaction gate cannot compute the diff to scan. {exc}")
+                reason = f"Redaction gate cannot compute the diff to scan. {exc}"
+                print(f"::error::{command_data(reason)}")
                 return 2
             print(
                 f"Scanning lines added in {from_commit[:12]}..{to_commit[:12]} ({how}), "
