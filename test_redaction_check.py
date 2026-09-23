@@ -823,6 +823,22 @@ def git_out(cwd: str | Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+def checkout_merge(tmp: Path, url: str, merge: str, depth: int | None = None) -> str:
+    """Check out a test-merge commit in a fresh clone, the way actions/checkout does."""
+    runner = Path(tempfile.mkdtemp(dir=tmp))
+    git_out(runner, "init", "-q")
+    git_out(runner, "remote", "add", "origin", url)
+    refspecs = [f"+{merge}:refs/remotes/pull/1/merge"]
+    depth_args = []
+    if depth is None:  # fetch-depth: 0 also fetches every branch
+        refspecs.insert(0, "+refs/heads/*:refs/remotes/origin/*")
+    else:
+        depth_args = [f"--depth={depth}"]
+    git_out(runner, "fetch", "-q", "--no-tags", *depth_args, "origin", *refspecs)
+    git_out(runner, "checkout", "-q", "--detach", "refs/remotes/pull/1/merge")
+    return str(runner)
+
+
 class MovedBaseTests(unittest.TestCase):
     """A base branch that moves while the check is queued must not break the scan.
 
@@ -875,18 +891,7 @@ class MovedBaseTests(unittest.TestCase):
 
     def checkout(self, depth: int | None = None) -> str:
         """Check out M in a fresh clone, the way actions/checkout does."""
-        runner = Path(tempfile.mkdtemp(dir=self.tmp))
-        git_out(runner, "init", "-q")
-        git_out(runner, "remote", "add", "origin", self.url)
-        refspecs = [f"+{self.merge}:refs/remotes/pull/1/merge"]
-        depth_args = []
-        if depth is None:  # fetch-depth: 0 also fetches every branch
-            refspecs.insert(0, "+refs/heads/*:refs/remotes/origin/*")
-        else:
-            depth_args = [f"--depth={depth}"]
-        git_out(runner, "fetch", "-q", "--no-tags", *depth_args, "origin", *refspecs)
-        git_out(runner, "checkout", "-q", "--detach", "refs/remotes/pull/1/merge")
-        return str(runner)
+        return checkout_merge(self.tmp, self.url, self.merge, depth)
 
     @staticmethod
     def shipped_refetch(runner: str) -> None:
@@ -993,6 +998,86 @@ class MovedBaseTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             run_main(["--pr-head", self.pr_head])
         self.assertEqual(ctx.exception.code, 2)
+
+
+class RewrittenBaseTests(unittest.TestCase):
+    """A base branch force-pushed under a pull request must not narrow the scan.
+
+    A private-IP leak lands on main in T, and a pull request branches from T
+    with an innocuous commit H. GitHub builds the test merge M on T. Main is
+    then force-pushed back to T0 plus a new commit B, which purges the leak,
+    but the pull request still carries T, so merging it brings the leak back.
+    M's first-parent range holds only H's change, so the scan has to widen to
+    the merge base of the rewritten main and M.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls._tmp.cleanup)
+        cls.tmp = Path(cls._tmp.name).resolve()
+        up = cls.tmp / "upstream"
+        up.mkdir()
+        git_out(up, "init", "-q", "-b", "main")
+        git_out(up, "config", "user.email", "test@example.com")
+        git_out(up, "config", "user.name", "test")
+        (up / "a.txt").write_text("base\n", encoding="utf-8")
+        git_out(up, "add", "-A")
+        git_out(up, "commit", "-qm", "T0")
+        cls.root_commit = git_out(up, "rev-parse", "HEAD")
+        (up / "leak.txt").write_text("nas " + "10.20.30.40" + "\n", encoding="utf-8")
+        git_out(up, "add", "-A")
+        git_out(up, "commit", "-qm", "T: a leak lands on main")
+        leaked_tip = git_out(up, "rev-parse", "HEAD")
+
+        git_out(up, "checkout", "-q", "-b", "feature")
+        (up / "f.txt").write_text("clean\n", encoding="utf-8")
+        git_out(up, "add", "-A")
+        git_out(up, "commit", "-qm", "H")
+        cls.pr_head = git_out(up, "rev-parse", "HEAD")
+
+        git_out(up, "checkout", "-q", "--detach", leaked_tip)
+        git_out(up, "merge", "-q", "--no-ff", "-m", "M", cls.pr_head)
+        cls.merge = git_out(up, "rev-parse", "HEAD")
+        git_out(up, "update-ref", "refs/pull/5/merge", cls.merge)
+
+        git_out(up, "checkout", "-q", "main")
+        git_out(up, "reset", "-q", "--hard", cls.root_commit)
+        (up / "o.txt").write_text("other\n", encoding="utf-8")
+        git_out(up, "add", "-A")
+        git_out(up, "commit", "-qm", "B: main rewritten, leak purged")
+        cls.url = up.as_uri()
+
+    def checkout(self, depth: int | None = None) -> str:
+        """Check out M, then fetch the rewritten main as the action does."""
+        runner = checkout_merge(self.tmp, self.url, self.merge, depth)
+        git_out(runner, "fetch", "-q", "--no-tags", "origin", "main")
+        return runner
+
+    def scan(self, runner: str) -> tuple[int, str]:
+        argv = ["--base", "origin/main", "--root", runner, "--pr-head", self.pr_head]
+        code, out, _err = run_main(argv)
+        return code, out
+
+    def test_rewritten_base_widens_the_range_to_the_merge_base(self):
+        runner = self.checkout()
+        frm, to, how = rc.resolve_diff_range("origin/main", runner, self.pr_head)
+        self.assertEqual((frm, to), (self.root_commit, self.merge))
+        self.assertIn("rewritten", how)
+
+    def test_cli_catches_the_leak_the_rewrite_purged_from_the_base(self):
+        code, out = self.scan(self.checkout())
+        self.assertEqual(code, 1)
+        self.assertIn("file=leak.txt", out)
+
+    def test_rewritten_base_without_history_to_widen_from_is_an_error(self):
+        # At depth 1 the first parent arrives by deepening, as a shallow
+        # boundary, so no merge base is visible. The base's own history is
+        # complete, which proves the rewrite, so the gate refuses to pass.
+        code, out = self.scan(self.checkout(depth=1))
+        self.assertEqual(code, 2)
+        self.assertIn("was rewritten", out)
+        self.assertNotIn("clean", out)
 
 
 class ActionDefinitionTests(unittest.TestCase):

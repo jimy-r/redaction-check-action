@@ -357,6 +357,59 @@ def _has_commit(rev: str, root: str) -> bool:
     return _git(root, "cat-file", "-e", f"{rev}^{{commit}}").returncode == 0
 
 
+def _history_is_complete(rev: str, root: str) -> bool:
+    """True when no shallow boundary cuts off any ancestor of rev."""
+    if _git(root, "rev-parse", "--is-shallow-repository").stdout.strip() != "true":
+        return True
+    roots = _git(root, "rev-list", "--max-parents=0", rev)
+    if roots.returncode != 0:
+        return False
+    # A shallow boundary is listed as a root, but its commit object still
+    # names the parents the clone does not have.
+    return not any(commit_parents(sha, root) for sha in roots.stdout.split())
+
+
+def _rewritten_base_range(
+    base: str, first_parent: str, head_sha: str, root: str
+) -> tuple[str, str, str] | None:
+    """Widen a test-merge range whose base branch was force-pushed.
+
+    The test merge's first parent was the base branch's tip when GitHub built
+    it. A base that has only moved forward still contains that commit, and
+    the first-parent range is exactly the pull request's change. A base that
+    was rewritten does not, and whatever the rewrite dropped but the pull
+    request still carries (a leak purged from the base, say) comes back when
+    it merges. So the range widens to the merge base of base and HEAD, what
+    `git diff base...HEAD` shows. Returns None to keep the first-parent range,
+    including when base is missing, since that range never needs it.
+    """
+    resolved = _git(root, "rev-parse", "--verify", f"{base}^{{commit}}")
+    if resolved.returncode != 0:
+        return None
+    base_sha = resolved.stdout.strip()
+    contains = _git(root, "merge-base", "--is-ancestor", first_parent, base_sha)
+    if contains.returncode == 0:
+        return None
+    merge_base = _git(root, "merge-base", base_sha, head_sha)
+    if merge_base.returncode == 0:
+        how = (
+            f"HEAD against its merge base with {base}, because {base} was "
+            "rewritten and no longer contains the commit the test merge was built on"
+        )
+        return merge_base.stdout.strip(), head_sha, how
+    if _history_is_complete(base_sha, root):
+        raise DiffError(
+            f"{base} no longer contains {first_parent[:12]}, the commit this test "
+            f"merge was built on, so {base} was rewritten. The scan has to widen "
+            f"to the merge base of {base} and HEAD, and this clone has none. "
+            "Check out with fetch-depth: 0."
+        )
+    # A shallow boundary hides part of the base's own history (a --depth
+    # fetch of the base does this), so a rewrite cannot be told apart from a
+    # base whose history is merely out of view. Keep the first-parent range.
+    return None
+
+
 def resolve_diff_range(
     base: str, root: str = ".", pr_head: str | None = None
 ) -> tuple[str, str, str]:
@@ -368,7 +421,8 @@ def resolve_diff_range(
     change, and it needs no merge base with the base branch's current tip, so
     a base that moves while the check is queued cannot break it. A shallow
     checkout that lacks the first parent is deepened by one commit from
-    origin.
+    origin. A base that was force-pushed instead widens the range; see
+    _rewritten_base_range.
 
     Otherwise the range starts at the merge base of base and HEAD, which is
     what `git diff base...HEAD` shows. Raises DiffError, with the reason, when
@@ -399,6 +453,9 @@ def resolve_diff_range(
                         f"first parent {first_parent[:12]} is not in this clone and "
                         f"deepening the fetch from origin failed ({detail})."
                     )
+            widened = _rewritten_base_range(base, first_parent, head_sha, root)
+            if widened:
+                return widened
             how = "the pull request's test-merge commit against its first parent"
             return first_parent, head_sha, how
         how += f", since HEAD does not merge pull request head {pr_head[:12]}"
