@@ -496,7 +496,9 @@ def resolve_diff_range(
 
 
 def git_diff(from_commit: str, to_commit: str, root: str = ".") -> str:
-    result = _git(root, "diff", "--unified=0", from_commit, to_commit)
+    # --no-color: a runner's color.ui=always would otherwise put escape codes
+    # in front of every line, and the parser would recognise none of them.
+    result = _git(root, "diff", "--no-color", "--unified=0", from_commit, to_commit)
     if result.returncode != 0:
         raise DiffError(f"git diff failed: {_last_error_line(result)}")
     return result.stdout

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import re
 import subprocess
 import sys
 import tempfile
@@ -1138,6 +1139,62 @@ class RewrittenBaseTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("was rewritten", out)
         self.assertNotIn("clean", out)
+
+
+# ---------------------------------------------------------------------------
+# What reaches the parser: `git diff` output whatever the change holds or the
+# runner's git config says
+# ---------------------------------------------------------------------------
+
+FINDING_RE = re.compile(r"^::error file=(.*),line=\d+::Possible (.+?): sha256:", re.M)
+IP = "10.20.30.40"
+
+
+class ScratchRepo:
+    """A throwaway repository with one base commit; tests add one more."""
+
+    def __init__(self, path: str):
+        self.path = Path(path)
+        git_out(self.path, "init", "-q", "-b", "main")
+        for key, value in [
+            ("user.email", "test@example.com"),
+            ("user.name", "test"),
+            ("core.autocrlf", "false"),  # keep CR bytes exactly as written
+        ]:
+            git_out(self.path, "config", key, value)
+        self.write("README.md", b"base\n")
+        self.commit("base")
+
+    def write(self, rel: str, data: bytes) -> None:
+        target = self.path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+
+    def commit(self, message: str) -> None:
+        git_out(self.path, "add", "-A")
+        git_out(self.path, "commit", "-qm", message)
+
+    def scan(self) -> tuple[int, list[tuple[str, str]]]:
+        """Scan HEAD~1..HEAD through the CLI: exit code and (path, label) pairs."""
+        code, out, _err = run_main(["--base", "HEAD~1", "--root", str(self.path)])
+        return code, FINDING_RE.findall(out)
+
+
+class GitDiffTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = ScratchRepo(tmp.name)
+
+    def test_runner_color_config_does_not_hide_the_diff(self):
+        # color.ui=always put escape codes before every line of the diff, so
+        # the parser recognised no header and scanned nothing.
+        self.repo.write("s.txt", f"host {IP}\n".encode())
+        self.repo.commit("add")
+        git_out(self.repo.path, "config", "color.ui", "always")
+        code, found = self.repo.scan()
+        self.assertEqual(code, 1)
+        self.assertEqual(found, [("s.txt", "private/link-local IP")])
 
 
 class ActionDefinitionTests(unittest.TestCase):
