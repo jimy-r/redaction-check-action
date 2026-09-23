@@ -603,6 +603,24 @@ class DiffParsingTests(unittest.TestCase):
             ],
         )
 
+    def test_quoted_and_tab_suffixed_header_paths_are_decoded(self):
+        # Git C-quotes a path with a non-ASCII byte (under the default
+        # core.quotePath), a control character, a quote or a backslash, and
+        # appends a tab to one with a space. Taken as printed, none of these
+        # had a basename that matched `.env`.
+        headers = {
+            '"b/caf\\303\\251/.env"': "café/.env",
+            "b/my dir/.env\t": "my dir/.env",
+            '"b/tab\\there/quote\\"d\\\\dir/.env"': 'tab\there/quote"d\\dir/.env',
+            '"b/two words\\001/.env"\t': "two words\x01/.env",
+        }
+        for header, path in headers.items():
+            with self.subTest(header=header):
+                diff = f"diff --git a/x b/x\n+++ {header}\n@@ -0,0 +1 @@\n+K=v\n"
+                self.assertEqual(list(rc.parse_added_lines(diff)), [(path, 1, "K=v")])
+                labels = [f.label for f in rc.scan_added_lines(diff)]
+                self.assertEqual(labels, ["dotenv file"])
+
     def test_a_diff_saved_with_crlf_still_parses(self):
         diff = "diff --git a/.env b/.env\r\n--- /dev/null\r\n+++ b/.env\r\n@@ -0,0 +1 @@\r\n+K=v\r\n"
         got = [(path, lineno) for path, lineno, _ in rc.parse_added_lines(diff)]
@@ -726,6 +744,21 @@ class ScanAllFilesTests(unittest.TestCase):
             subprocess.run(["git", "add", ".env"], cwd=tmp, check=True)
             findings = rc.scan_all_files(tmp)
             self.assertEqual([f.label for f in findings], ["dotenv file"])
+
+    def test_secret_file_under_a_non_ascii_directory_is_found(self):
+        # Plain `git ls-files` quoted this name, so it neither matched a
+        # secret filename nor opened for the content scan.
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["git", "init", "-q"], cwd=tmp, check=True)
+            envfile = Path(tmp) / "café" / ".env"
+            envfile.parent.mkdir()
+            envfile.write_text("HOST=" + "10.20.30.40" + "\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=tmp, check=True)
+            found = [(f.path, f.label) for f in rc.scan_all_files(tmp)]
+        self.assertEqual(
+            found,
+            [("café/.env", "dotenv file"), ("café/.env", "private/link-local IP")],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1282,6 +1315,19 @@ class GitDiffTests(unittest.TestCase):
         code, found = self.repo.scan()
         self.assertEqual(code, 1)
         self.assertEqual(sorted(found), [(n, "private/link-local IP") for n in files])
+
+    def test_secret_file_under_an_unusual_directory_name_is_flagged(self):
+        # Quoted "caf\303\251/.env" and tab-suffixed "my dir/.env" headers
+        # used to hide both files from the filename check.
+        for name in ["café/.env", "my dir/.env"]:
+            self.repo.write(name, b"K=v\n")
+        self.repo.commit("add")
+        code, found = self.repo.scan()
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            sorted(found),
+            [("café/.env", "dotenv file"), ("my dir/.env", "dotenv file")],
+        )
 
     def test_file_whose_line_looks_like_a_header_is_scanned(self):
         self.repo.write("pp.txt", f"++ /dev/null\nhost {IP}\n".encode())

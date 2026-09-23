@@ -266,6 +266,46 @@ def load_extra_patterns(path: str) -> list[tuple[str, re.Pattern[str]]]:
 DIFF_HEADER_RE = re.compile(r"^diff --git ")
 HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
+# Git's C-style escapes inside a quoted path. An octal escape is one byte.
+C_ESCAPE_RE = re.compile(r"\\(?:([0-7]{3})|(.))", re.DOTALL)
+C_ESCAPES = {
+    "a": "\a",
+    "b": "\b",
+    "t": "\t",
+    "n": "\n",
+    "v": "\v",
+    "f": "\f",
+    "r": "\r",
+}
+
+
+def unquote_header_path(raw: str) -> str:
+    """Return a path from a diff header as it is on disk.
+
+    Git appends a tab to a header path that contains a space. It C-quotes a
+    path holding a control character, a double quote or a backslash (and,
+    unless core.quotePath is false, any non-ASCII byte), writing each odd
+    byte as an escape. Left as printed, `"b/caf\\303\\251/.env"` or
+    `b/my dir/.env<TAB>` has no basename that matches `.env`.
+    """
+    if raw.endswith("\t"):
+        raw = raw[:-1]
+    if len(raw) < 2 or raw[0] != '"' or raw[-1] != '"':
+        return raw
+    body = raw[1:-1]
+    out = bytearray()
+    pos = 0
+    for m in C_ESCAPE_RE.finditer(body):
+        out += body[pos : m.start()].encode("utf-8")
+        octal, char = m.groups()
+        if octal:
+            out.append(int(octal, 8) & 0xFF)
+        else:
+            out += C_ESCAPES.get(char, char).encode("utf-8")
+        pos = m.end()
+    out += body[pos:].encode("utf-8")
+    return out.decode("utf-8", "replace")
+
 
 def parse_added_lines(diff_text: str) -> Iterator[tuple[str, int, str]]:
     """Yield (path, lineno, text) for every added line in a unified diff.
@@ -300,7 +340,8 @@ def parse_added_lines(diff_text: str) -> Iterator[tuple[str, int, str]]:
             continue
         if in_header:
             if line.startswith("+++ "):
-                new_path = line[4:].rstrip("\r")  # a diff file saved with CRLF
+                # rstrip: a diff file saved with CRLF line endings.
+                new_path = unquote_header_path(line[4:].rstrip("\r"))
                 if new_path == "/dev/null":
                     path = None
                 elif new_path.startswith("b/"):
@@ -511,7 +552,17 @@ def resolve_diff_range(
 def git_diff(from_commit: str, to_commit: str, root: str = ".") -> str:
     # --no-color: a runner's color.ui=always would otherwise put escape codes
     # in front of every line, and the parser would recognise none of them.
-    result = _git(root, "diff", "--no-color", "--unified=0", from_commit, to_commit)
+    # core.quotePath=false: a non-ASCII path prints as itself, not quoted.
+    result = _git(
+        root,
+        "-c",
+        "core.quotePath=false",
+        "diff",
+        "--no-color",
+        "--unified=0",
+        from_commit,
+        to_commit,
+    )
     if result.returncode != 0:
         raise DiffError(f"git diff failed: {_last_error_line(result)}")
     return _text(result.stdout)
@@ -524,17 +575,15 @@ def get_diff_via_git(base: str, root: str = ".", pr_head: str | None = None) -> 
 
 
 def iter_tracked_files(root: str = ".") -> Iterator[str]:
+    # -z prints each name NUL-terminated and never quoted. Without it a
+    # non-ASCII name arrived as "caf\303\251/.env", which neither matched a
+    # secret filename nor opened.
     result = subprocess.run(
-        ["git", "-C", root, "ls-files"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=True,
+        ["git", "-C", root, "ls-files", "-z"], capture_output=True, check=True
     )
-    for line in result.stdout.splitlines():
-        if line:
-            yield line
+    for name in _text(result.stdout).split("\0"):
+        if name:
+            yield name
 
 
 # ---------------------------------------------------------------------------
