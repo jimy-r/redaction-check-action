@@ -18,12 +18,12 @@ cd redaction-check-action
 python -m unittest test_redaction_check -v
 ```
 
-Run the scanner directly to see what it does on a real tree:
+Run the scanner directly to see what it does on a real tree. In this repository, pass `--skip-scanner-files`, or the scanner flags its own test fixtures:
 
 ```bash
-python redaction_check.py --mode all-files          # walk every tracked file
-python redaction_check.py --base main               # added lines against a base ref
-python redaction_check.py --selftest                # built-in pattern assertions
+python redaction_check.py --mode all-files --skip-scanner-files   # walk every tracked file
+python redaction_check.py --base main --skip-scanner-files        # added lines against a base ref
+python redaction_check.py --selftest                              # built-in pattern assertions
 ```
 
 ## Before you push

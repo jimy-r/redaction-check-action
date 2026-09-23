@@ -66,6 +66,9 @@ jobs:
         continue-on-error: true
         with:
           base-ref: main
+          # This repository's own opt-in: the scanner and its tests carry
+          # secret-shaped fixtures on purpose.
+          skip-scanner-files: 'true'
 
       - name: Assert the dirty fixture was caught
         shell: bash
@@ -89,6 +92,7 @@ jobs:
         uses: ./
         with:
           base-ref: main
+          skip-scanner-files: 'true'
 
       - name: Assert the clean fixture passed
         shell: bash

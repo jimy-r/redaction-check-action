@@ -74,6 +74,7 @@ jobs:
 | `fail-on` | `match` | `match` fails the step on any finding. `none` reports findings as warnings without failing on them, useful while first rolling the gate out on an existing repo. A diff that can't be computed fails the step either way. |
 | `scan-mode` | `added-lines` | `added-lines` scans only what the PR adds. `all-files` walks every git-tracked file instead, for a full-repo audit run. |
 | `base-ref` | *(auto)* | Branch to diff against, or a full commit SHA. Defaults to the pull request's base branch. Set it explicitly when triggering on an event other than `pull_request`, and on `push` see [Running on push](#running-on-push). |
+| `skip-scanner-files` | `false` | `true` skips `redaction_check.py` and `test_redaction_check.py` at the repository root. This action's own repository sets it, because its tests are full of secret-shaped fixtures on purpose. Leave it off anywhere else. With it off, files that happen to share those names are scanned like any other. |
 
 ## The masking guarantee
 

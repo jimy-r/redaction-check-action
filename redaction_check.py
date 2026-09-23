@@ -34,7 +34,7 @@ import hashlib
 import re
 import subprocess
 import sys
-from collections.abc import Iterable, Iterator
+from collections.abc import Collection, Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -45,9 +45,10 @@ SUPPRESS_MARKER = "redaction-ok"
 
 # This scanner's own source and test suite carry realistic-shaped fixtures on
 # purpose (the positive test cases need real credential/path shapes to prove
-# the patterns work). Exclude both from being scanned so the gate never
-# self-flags when someone edits this action's own repo.
-SELF_PATHS = {"redaction_check.py", "test_redaction_check.py"}
+# the patterns work). --skip-scanner-files excludes both, for this action's own
+# repository. It is off by default: skipping them unasked let a consumer's
+# file that merely shared one of these names through unscanned.
+SELF_PATHS = frozenset({"redaction_check.py", "test_redaction_check.py"})
 
 MAX_FILE_BYTES = 2_000_000  # skip pathologically large tracked files (--mode all-files)
 
@@ -644,17 +645,19 @@ def scan_added_lines(
     diff_text: str,
     extra_patterns: Iterable[tuple[str, re.Pattern[str]]] = (),
     added_paths: Iterable[str] = (),
+    skip_paths: Collection[str] = frozenset(),
 ) -> list[Finding]:
     """Scan a diff's added lines, and the name of each file it adds to.
 
     added_paths (see git_added_paths) names the files the range adds or
     renames. Each gets the filename check even when the diff shows no line
-    for it, as with a binary file, an empty file or a pure rename.
+    for it, as with a binary file, an empty file or a pure rename. Paths in
+    skip_paths are not scanned at all.
     """
     findings: list[Finding] = []
     seen_paths: set[str] = set()
     for path, lineno, text in parse_added_lines(diff_text):
-        if path in SELF_PATHS:
+        if path in skip_paths:
             continue
         if path not in seen_paths:
             seen_paths.add(path)
@@ -666,7 +669,7 @@ def scan_added_lines(
         for hit_label, matched in scan_line(text, extra_patterns):
             findings.append(Finding(path, lineno, hit_label, mask(matched)))
     for path in added_paths:
-        if path in SELF_PATHS or path in seen_paths:
+        if path in skip_paths or path in seen_paths:
             continue
         seen_paths.add(path)
         label = check_filename(path)
@@ -676,12 +679,14 @@ def scan_added_lines(
 
 
 def scan_all_files(
-    root: str = ".", extra_patterns: Iterable[tuple[str, re.Pattern[str]]] = ()
+    root: str = ".",
+    extra_patterns: Iterable[tuple[str, re.Pattern[str]]] = (),
+    skip_paths: Collection[str] = frozenset(),
 ) -> list[Finding]:
     findings: list[Finding] = []
     root_path = Path(root)
     for rel_path in iter_tracked_files(root):
-        if rel_path in SELF_PATHS:
+        if rel_path in skip_paths:
             continue
         label = check_filename(rel_path)
         if label:
@@ -815,6 +820,13 @@ def main(argv: list[str] | None = None) -> int:
         "without failing on them",
     )
     ap.add_argument(
+        "--skip-scanner-files",
+        action="store_true",
+        help="skip redaction_check.py and test_redaction_check.py at the repo root, "
+        "whose test fixtures are secret-shaped on purpose. For this action's own "
+        "repository: anywhere else, files with those names are scanned as usual",
+    )
+    ap.add_argument(
         "--selftest",
         action="store_true",
         help="run built-in pattern assertions and exit",
@@ -829,9 +841,10 @@ def main(argv: list[str] | None = None) -> int:
     extra_patterns = (
         load_extra_patterns(args.patterns_file) if args.patterns_file else []
     )
+    skip_paths = SELF_PATHS if args.skip_scanner_files else frozenset()
 
     if args.mode == "all-files":
-        findings = scan_all_files(args.root, extra_patterns)
+        findings = scan_all_files(args.root, extra_patterns, skip_paths)
     else:
         added_paths: list[str] = []
         if args.base:
@@ -859,7 +872,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             stdin_bytes = getattr(sys.stdin, "buffer", None)
             diff_text = _text(stdin_bytes.read()) if stdin_bytes else sys.stdin.read()
-        findings = scan_added_lines(diff_text, extra_patterns, added_paths)
+        findings = scan_added_lines(diff_text, extra_patterns, added_paths, skip_paths)
 
     return report(findings, args.fail_on)
 

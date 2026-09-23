@@ -689,16 +689,34 @@ class ScanAddedLinesTests(unittest.TestCase):
         filename_hits = [f for f in findings if f.label == "dotenv file"]
         self.assertEqual(len(filename_hits), 1)
 
-    def test_self_paths_are_excluded(self):
-        diff = (
-            "diff --git a/redaction_check.py b/redaction_check.py\n"
-            "index 1..2 100644\n"
-            "--- a/redaction_check.py\n"
-            "+++ b/redaction_check.py\n"
-            "@@ -0,0 +1,1 @@\n"
-            "+token " + "sk-ant-" + "api03EXAMPLEKEY0000000\n"
-        )
-        self.assertEqual(rc.scan_added_lines(diff), [])
+    SCANNER_FILE_DIFF = (
+        "diff --git a/test_redaction_check.py b/test_redaction_check.py\n"
+        "index 1..2 100644\n"
+        "--- a/test_redaction_check.py\n"
+        "+++ b/test_redaction_check.py\n"
+        "@@ -0,0 +1,1 @@\n"
+        "+token " + "sk-ant-" + "api03EXAMPLEKEY0000000\n"
+    )
+
+    def test_files_named_like_the_scanner_are_scanned_by_default(self):
+        # These names were skipped unasked, so a consumer's own file called
+        # test_redaction_check.py passed whatever it held.
+        labels = [f.label for f in rc.scan_added_lines(self.SCANNER_FILE_DIFF)]
+        self.assertEqual(labels, ["Anthropic API key"])
+
+    def test_scanner_files_are_skipped_only_when_asked(self):
+        skipped = rc.scan_added_lines(self.SCANNER_FILE_DIFF, (), (), rc.SELF_PATHS)
+        self.assertEqual(skipped, [])
+        nested = self.SCANNER_FILE_DIFF.replace("test_redaction_check.py", "sub/x.py")
+        self.assertTrue(rc.scan_added_lines(nested, (), (), rc.SELF_PATHS))
+
+    def test_cli_skips_scanner_files_only_with_the_flag(self):
+        for argv, expected in [([], 1), (["--skip-scanner-files"], 0)]:
+            with self.subTest(argv=argv):
+                code, _out, _err = run_main(
+                    ["--diff-file", "-", *argv], stdin_text=self.SCANNER_FILE_DIFF
+                )
+                self.assertEqual(code, expected)
 
     def test_added_paths_get_the_filename_check_once(self):
         diff = (
@@ -755,6 +773,17 @@ class ScanAllFilesTests(unittest.TestCase):
             subprocess.run(["git", "add", ".env"], cwd=tmp, check=True)
             findings = rc.scan_all_files(tmp)
             self.assertEqual([f.label for f in findings], ["dotenv file"])
+
+    def test_scanner_file_names_are_walked_unless_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["git", "init", "-q"], cwd=tmp, check=True)
+            probe = Path(tmp) / "test_redaction_check.py"
+            probe.write_text("HOST = '" + "10.20.30.40" + "'\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=tmp, check=True)
+            walked = [f.path for f in rc.scan_all_files(tmp)]
+            skipped = rc.scan_all_files(tmp, (), rc.SELF_PATHS)
+        self.assertEqual(walked, ["test_redaction_check.py"])
+        self.assertEqual(skipped, [])
 
     def test_secret_file_under_a_non_ascii_directory_is_found(self):
         # Plain `git ls-files` quoted this name, so it neither matched a
@@ -1457,6 +1486,13 @@ class ActionDefinitionTests(unittest.TestCase):
         # to pass origin/<sha>, which names nothing, so the scan exited 2.
         self.assertTrue(any("[0-9a-f]{40}" in ln for ln in self.code))
         self.assertTrue(any('--base "$base"' in ln for ln in self.code))
+
+    def test_skipping_the_scanner_files_is_opt_in(self):
+        text = (THIS_DIR / "action.yml").read_text(encoding="utf-8")
+        declared = re.search(r"\n  skip-scanner-files:\n(?:    .*\n)+", text)
+        self.assertIsNotNone(declared)
+        self.assertIn("default: 'false'", declared.group(0))
+        self.assertTrue(any("--skip-scanner-files" in ln for ln in self.code))
 
     def test_the_pull_request_head_reaches_the_scanner(self):
         self.assertTrue(

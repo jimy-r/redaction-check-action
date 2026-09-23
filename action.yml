@@ -44,6 +44,14 @@ inputs:
       moves while the check is queued cannot break it.
     required: false
     default: ''
+  skip-scanner-files:
+    description: >-
+      'true' skips redaction_check.py and test_redaction_check.py at the
+      repository root, whose test fixtures are secret-shaped on purpose.
+      Only this action's own repository should set it. Anywhere else,
+      files with those names are scanned like any other. Default 'false'.
+    required: false
+    default: 'false'
 
 runs:
   using: composite
@@ -62,11 +70,15 @@ runs:
         BASE_REF: ${{ inputs.base-ref || github.base_ref }}
         PR_BASE_REF: ${{ github.base_ref }}
         PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        SKIP_SCANNER_FILES: ${{ inputs.skip-scanner-files }}
       run: |
         set -euo pipefail
         args=(--fail-on "$FAIL_ON")
         if [ -n "$PATTERNS_FILE" ]; then
           args+=(--patterns-file "$PATTERNS_FILE")
+        fi
+        if [ "$SKIP_SCANNER_FILES" = "true" ]; then
+          args+=(--skip-scanner-files)
         fi
 
         if [ "$SCAN_MODE" = "all-files" ]; then
