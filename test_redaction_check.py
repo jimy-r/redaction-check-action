@@ -1433,6 +1433,12 @@ class ActionDefinitionTests(unittest.TestCase):
         # MovedBaseTests reproduces it.
         self.assertEqual([ln for ln in self.code if "--depth" in ln], [])
 
+    def test_a_commit_sha_base_is_not_read_as_a_branch(self):
+        # On a push the base is github.event.before, a SHA, and the step used
+        # to pass origin/<sha>, which names nothing, so the scan exited 2.
+        self.assertTrue(any("[0-9a-f]{40}" in ln for ln in self.code))
+        self.assertTrue(any('--base "$base"' in ln for ln in self.code))
+
     def test_the_pull_request_head_reaches_the_scanner(self):
         self.assertTrue(
             any("github.event.pull_request.head.sha" in ln for ln in self.code)

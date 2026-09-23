@@ -34,12 +34,14 @@ inputs:
     default: added-lines
   base-ref:
     description: >-
-      Branch or ref to diff against in added-lines mode. Defaults to the
-      pull request's base branch (github.base_ref). Set this explicitly
-      when triggering on an event other than pull_request. On a
-      pull_request event against that same base, the scan diffs GitHub's
-      test-merge commit against its own first parent instead, so a base
-      branch that moves while the check is queued cannot break it.
+      Branch to diff against in added-lines mode, or a full commit SHA.
+      Defaults to the pull request's base branch (github.base_ref). Set
+      this explicitly when triggering on an event other than pull_request.
+      On a push, pass github.event.before: a push to main with base-ref
+      main diffs main against itself and scans nothing. On a pull_request
+      event against that same base, the scan diffs GitHub's test-merge
+      commit against its own first parent instead, so a base branch that
+      moves while the check is queued cannot break it.
     required: false
     default: ''
 
@@ -83,6 +85,12 @@ runs:
           if ! git fetch --no-tags origin "$BASE_REF"; then
             echo "::warning::Could not fetch $BASE_REF from origin. Diffing against the checkout's own copy of it."
           fi
+          # A full commit SHA (github.event.before on a push) is the base as
+          # it stands. Anything else names a branch on origin.
+          base="origin/$BASE_REF"
+          if [[ "$BASE_REF" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+            base="$BASE_REF"
+          fi
           # On a pull_request event the checkout is GitHub's test-merge commit.
           # Given the head SHA, the scanner diffs that commit against its own
           # first parent, which needs no merge base with the base branch.
@@ -90,5 +98,5 @@ runs:
             args+=(--pr-head "$PR_HEAD_SHA")
           fi
           python "${{ github.action_path }}/redaction_check.py" --mode added-lines \
-            --base "origin/$BASE_REF" "${args[@]}"
+            --base "$base" "${args[@]}"
         fi
