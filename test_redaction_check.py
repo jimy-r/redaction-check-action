@@ -15,6 +15,7 @@ import hashlib
 import io
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -1837,6 +1838,136 @@ class ActionDefinitionTests(unittest.TestCase):
             any("github.event.pull_request.head.sha" in ln for ln in self.code)
         )
         self.assertTrue(any("--pr-head" in ln for ln in self.code))
+
+
+class BaseRefGuardTests(unittest.TestCase):
+    def test_a_base_git_could_read_as_an_option_never_reaches_git(self):
+        # git reads a value that starts with "-" as an option. A control
+        # character could end a log line and start a workflow command.
+        for base in ["--upload-pack=touch INJECTED", "-x", "main\n::warning::forged"]:
+            with (
+                self.subTest(base=base),
+                mock.patch.object(rc, "_git", side_effect=AssertionError("git ran")),
+            ):
+                code, out, _err = run_main([f"--base={base}"])
+                self.assertEqual(code, 2)
+                self.assertIn("cannot start with '-' or hold a control", out)
+                self.assertEqual(
+                    [ln[:8] for ln in out.splitlines() if ln.startswith("::")],
+                    ["::error:"],
+                )
+
+    def test_the_action_refuses_such_a_base_ref_before_it_fetches(self):
+        text = (THIS_DIR / "action.yml").read_text(encoding="utf-8")
+        code = [ln for ln in text.splitlines() if not ln.strip().startswith("#")]
+        guard = next(i for i, ln in enumerate(code) if "-* | *[[:cntrl:]]*)" in ln)
+        fetch = next(i for i, ln in enumerate(code) if "git fetch" in ln)
+        self.assertLess(guard, fetch)
+        self.assertIn("exit 2", code[guard + 2])
+        self.assertIn('origin -- "$BASE_REF"', code[fetch])
+
+
+def action_step_script() -> str:
+    """The scan step's run block from action.yml, as a runner would run it."""
+    lines = (THIS_DIR / "action.yml").read_text(encoding="utf-8").splitlines()
+    name = next(i for i, ln in enumerate(lines) if "Scan for private-content" in ln)
+    start = next(i for i in range(name, len(lines)) if lines[i].strip() == "run: |")
+    indent = len(lines[start + 1]) - len(lines[start + 1].lstrip())
+    body = []
+    for line in lines[start + 1 :]:
+        if line.strip() and len(line) - len(line.lstrip()) < indent:
+            break
+        body.append(line[indent:])
+    script = "\n".join(body) + "\n"
+    script = script.replace("${{ github.action_path }}", THIS_DIR.as_posix())
+    if "${{" in script:
+        raise AssertionError("an expression other than github.action_path is left")
+    return script
+
+
+# System32's bash.exe is WSL's, which cannot run the Windows git and python.
+BASH = shutil.which("bash")
+if BASH and os.name == "nt" and "system32" in BASH.lower():
+    BASH = None
+
+
+@unittest.skipUnless(BASH, "needs bash, as a runner has")
+class ActionStepTests(unittest.TestCase):
+    """Run action.yml's own scan step, the shell text a runner executes."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls._tmp.cleanup)
+        cls.tmp = Path(cls._tmp.name).resolve()
+        # `python` in the step is this interpreter, whatever PATH holds.
+        shim = cls.tmp / "bin"
+        shim.mkdir()
+        python = Path(sys.executable).as_posix()
+        (shim / "python").write_text(
+            f'#!/bin/sh\nexec "{python}" "$@"\n', encoding="utf-8", newline="\n"
+        )
+        (shim / "python").chmod(0o755)
+        cls.script = cls.tmp / "step.sh"
+        cls.script.write_text(action_step_script(), encoding="utf-8", newline="\n")
+        (cls.tmp / "upstream").mkdir()
+        up = ScratchRepo(str(cls.tmp / "upstream"))
+        cls.base = up.head()
+        up.write("notes.txt", f"host {IP}\n".encode())
+        up.commit("add a host")
+        cls.url = up.path.as_uri()
+
+    def clone(self) -> Path:
+        runner = Path(tempfile.mkdtemp(dir=self.tmp))
+        git_out(self.tmp, "clone", "-q", self.url, str(runner))
+        return runner
+
+    def run_step(self, cwd: Path, **env: str) -> tuple[int, str]:
+        outputs = Path(tempfile.mkdtemp(dir=self.tmp)) / "github_output"
+        step_env = {
+            **os.environ,
+            "PATH": str(self.tmp / "bin") + os.pathsep + os.environ["PATH"],
+            "FAIL_ON": "match",
+            "SCAN_MODE": "added-lines",
+            "PATTERNS_FILE": "",
+            "SKIP_SCANNER_FILES": "false",
+            "BASE_REF": "",
+            "PR_BASE_REF": "",
+            "PR_HEAD_SHA": "",
+            "GITHUB_OUTPUT": outputs.as_posix(),
+            "RUNNER_TEMP": self.tmp.as_posix(),
+            **env,
+        }
+        result = subprocess.run(
+            [BASH, self.script.as_posix()],
+            cwd=cwd,
+            env=step_env,
+            capture_output=True,
+            check=False,
+        )
+        return result.returncode, rc._text(result.stdout + result.stderr)
+
+    def test_a_base_ref_that_looks_like_an_option_runs_no_command(self):
+        # Over a file or ssh remote, git fetch ran --upload-pack's command.
+        runner = self.clone()
+        base_ref = "--upload-pack=touch${IFS}INJECTED;git-upload-pack"
+        code, out = self.run_step(runner, BASE_REF=base_ref)
+        self.assertEqual(code, 2, out)
+        self.assertIn("::error::base-ref cannot start with '-'", out)
+        self.assertFalse((runner / "INJECTED").exists())
+
+    def test_a_base_ref_with_a_newline_cannot_forge_a_command(self):
+        runner = self.clone()
+        code, out = self.run_step(runner, BASE_REF="main\n::warning::forged")
+        self.assertEqual(code, 2, out)
+        self.assertNotIn("\n::warning::", "\n" + out)
+
+    def test_a_commit_sha_base_ref_is_scanned(self):
+        code, out = self.run_step(self.clone(), BASE_REF=self.base)
+        self.assertEqual(code, 1, out)
+        self.assertEqual(
+            FINDING_RE.findall(out), [("notes.txt", "private/link-local IP")]
+        )
 
 
 class SelftestTests(unittest.TestCase):

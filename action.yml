@@ -88,13 +88,22 @@ runs:
             echo "::error::scan-mode is added-lines but no base ref is available. Set the base-ref input, or trigger this action on pull_request."
             exit 1
           fi
+          # Before any git call. git fetch reads a value that starts with "-"
+          # as an option, and --upload-pack=<command> runs that command over a
+          # file or ssh remote. A control character could end a log line.
+          case "$BASE_REF" in
+            -* | *[[:cntrl:]]*)
+              echo "::error::base-ref cannot start with '-' or hold a control character. Pass a branch name or a full commit SHA."
+              exit 2
+              ;;
+          esac
           # Full-depth fetch only. A shallow fetch into the checkout's full
           # clone marks the fetched tip as a history boundary. Once the base
           # has moved past the pull request's merge commit, that tip shares no
           # visible history with HEAD and there is no merge base to diff from.
           # A failed fetch still leaves the checkout's own origin/<base-ref>,
           # and the scanner fails loudly if that is missing too.
-          if ! git fetch --no-tags origin "$BASE_REF"; then
+          if ! git fetch --no-tags origin -- "$BASE_REF"; then
             # Escaped as @actions/core escapes a message, so the value cannot
             # end this line and start a workflow command of its own.
             ref=${BASE_REF//%/%25}; ref=${ref//$'\r'/%0D}; ref=${ref//$'\n'/%0A}

@@ -512,7 +512,7 @@ def _history_is_complete(rev: str, root: str) -> bool:
     shallow = _git(root, "rev-parse", "--is-shallow-repository")
     if _text(shallow.stdout).strip() != "true":
         return True
-    roots = _git(root, "rev-list", "--max-parents=0", rev)
+    roots = _git(root, "rev-list", "--max-parents=0", rev, "--")
     if roots.returncode != 0:
         return False
     # A shallow boundary is listed as a root, but its commit object still
@@ -538,10 +538,10 @@ def _rewritten_base_range(
     if resolved.returncode != 0:
         return None
     base_sha = _text(resolved.stdout).strip()
-    contains = _git(root, "merge-base", "--is-ancestor", first_parent, base_sha)
+    contains = _git(root, "merge-base", "--is-ancestor", "--", first_parent, base_sha)
     if contains.returncode == 0:
         return None
-    merge_base = _git(root, "merge-base", base_sha, head_sha)
+    merge_base = _git(root, "merge-base", "--", base_sha, head_sha)
     if merge_base.returncode == 0:
         how = (
             f"HEAD against its merge base with {base}, because {base} was "
@@ -579,6 +579,14 @@ def resolve_diff_range(
     what `git diff base...HEAD` shows. Raises DiffError, with the reason, when
     the range cannot be computed.
     """
+    # Before any git call: git reads a value that starts with "-" as an
+    # option, and a control character could end a log line and start a
+    # workflow command.
+    if base.startswith("-") or any(ord(ch) < 32 or ord(ch) == 127 for ch in base):
+        raise DiffError(
+            "The base ref cannot start with '-' or hold a control character. "
+            "Pass a branch name or a full commit SHA."
+        )
     head = _git(root, "rev-parse", "--verify", "HEAD^{commit}")
     if head.returncode != 0:
         raise DiffError(f"HEAD does not name a commit: {_last_error_line(head)}")
@@ -591,7 +599,7 @@ def resolve_diff_range(
             first_parent = parents[0]
             if not _has_commit(first_parent, root):
                 fetch = _git(
-                    root, "fetch", "--no-tags", "--deepen=1", "origin", head_sha
+                    root, "fetch", "--no-tags", "--deepen=1", "--", "origin", head_sha
                 )
                 if not _has_commit(first_parent, root):
                     detail = (
@@ -612,7 +620,9 @@ def resolve_diff_range(
         # Anything else must at least contain the pull request's head, or the
         # merge-base range below scans some other change. pull_request_target
         # checks out the base branch by default, and that range is then empty.
-        contains = _git(root, "merge-base", "--is-ancestor", pr_head.strip(), head_sha)
+        contains = _git(
+            root, "merge-base", "--is-ancestor", "--", pr_head.strip(), head_sha
+        )
         if contains.returncode != 0:
             raise DiffError(
                 f"HEAD does not contain pull request head {pr_head[:12]}, so this "
@@ -629,7 +639,7 @@ def resolve_diff_range(
             "fetch-depth: 0 so the base branch's history is present."
         )
     base_sha = _text(base_commit.stdout).strip()
-    merge_base = _git(root, "merge-base", base_sha, head_sha)
+    merge_base = _git(root, "merge-base", "--", base_sha, head_sha)
     if merge_base.returncode != 0:
         shallow = _git(root, "rev-parse", "--is-shallow-repository")
         hint = (
@@ -665,6 +675,7 @@ def git_diff(from_commit: str, to_commit: str, root: str = ".") -> str:
         "--unified=0",
         from_commit,
         to_commit,
+        "--",
     )
     if result.returncode != 0:
         raise DiffError(f"git diff failed: {_last_error_line(result)}")
@@ -688,6 +699,7 @@ def git_added_paths(from_commit: str, to_commit: str, root: str = ".") -> list[s
         "--diff-filter=ACR",
         from_commit,
         to_commit,
+        "--",
     )
     if result.returncode != 0:
         raise DiffError(f"git diff --name-only failed: {_last_error_line(result)}")
@@ -737,7 +749,7 @@ def _shallow_boundaries(root: str) -> set[str]:
 
 
 def commits_in_range(from_commit: str, to_commit: str, root: str = ".") -> list[str]:
-    result = _git(root, "rev-list", f"{from_commit}..{to_commit}")
+    result = _git(root, "rev-list", f"{from_commit}..{to_commit}", "--")
     if result.returncode != 0:
         raise DiffError(
             f"cannot list the commits in {from_commit[:12]}..{to_commit[:12]}: "
@@ -764,7 +776,7 @@ def require_visible_commits(
     cut = [sha for sha in commits if sha in boundaries]
     detail = ""
     if cut:
-        fetch = _git(root, "fetch", "--no-tags", "--unshallow", "origin", *cut)
+        fetch = _git(root, "fetch", "--no-tags", "--unshallow", "--", "origin", *cut)
         if fetch.returncode:
             detail = f" Fetching their history failed: {_last_error_line(fetch)}"
         commits = commits_in_range(from_commit, to_commit, root)
@@ -802,6 +814,7 @@ def _git_log(root: str, from_commit: str, to_commit: str, *output: str) -> str:
         "--format=%x00%H",
         *output,
         f"{from_commit}..{to_commit}",
+        "--",
     )
     if result.returncode != 0:
         raise DiffError(f"git log failed: {_last_error_line(result)}")
