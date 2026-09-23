@@ -82,6 +82,13 @@ jobs:
 | `base-ref` | *(auto)* | Branch to diff against, or a full commit SHA. Defaults to the pull request's base branch. A value that starts with `-` or holds a control character fails the step before any git command runs, since git would read it as an option. Set it explicitly when triggering on an event other than `pull_request`, and on `push` see [Running on push](#running-on-push). |
 | `skip-scanner-files` | `false` | `true` skips `redaction_check.py` and `test_redaction_check.py` at the repository root. This action's own repository sets it, because its tests are full of secret-shaped fixtures on purpose. Leave it off anywhere else. With it off, files that happen to share those names are scanned like any other. |
 
+## Outputs
+
+| Output | Meaning |
+|---|---|
+| `exit-code` | The scan's exit code. `0` is clean, or findings under `fail-on: none`. `1` is findings. `2` is a scan that could not run, such as a `base-ref` it can't use or a diff it can't compute. |
+| `report` | Path to a file on the runner that holds the scanner's output, the same masked findings the log shows. |
+
 ## The masking guarantee
 
 A finding never prints the thing it caught. Every match collapses to a short keyed hash (`hmac:9f2a1b3c4d5e`, HMAC-SHA256) before it reaches the log, so a run on a public repo can't itself become the leak. The key is random, made fresh for each run and never printed. The same value gets the same tag within a run, so repeats line up, but nobody can recompute a tag from guesses, even for a value with few possibilities like a private IP, and tags from two runs can't be matched up. The test suite confirms this directly. The raw matched text is asserted absent from every code path that produces output, across every pattern class, checked in code rather than trusted by eye.

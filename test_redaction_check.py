@@ -1917,10 +1917,10 @@ class BaseRefGuardTests(unittest.TestCase):
         self.assertIn('origin -- "$BASE_REF"', code[fetch])
 
 
-def action_step_script() -> str:
-    """The scan step's run block from action.yml, as a runner would run it."""
-    lines = (THIS_DIR / "action.yml").read_text(encoding="utf-8").splitlines()
-    name = next(i for i, ln in enumerate(lines) if "Scan for private-content" in ln)
+def run_block(path: Path, step_name: str) -> str:
+    """Return the `run: |` block of the step with this name, dedented."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    name = next(i for i, ln in enumerate(lines) if ln.strip() == f"- name: {step_name}")
     start = next(i for i in range(name, len(lines)) if lines[i].strip() == "run: |")
     indent = len(lines[start + 1]) - len(lines[start + 1].lstrip())
     body = []
@@ -1931,8 +1931,19 @@ def action_step_script() -> str:
     script = "\n".join(body) + "\n"
     script = script.replace("${{ github.action_path }}", THIS_DIR.as_posix())
     if "${{" in script:
-        raise AssertionError("an expression other than github.action_path is left")
+        raise AssertionError(f"{step_name}: an expression is left in its run block")
     return script
+
+
+def run_bash(script: Path, cwd: Path, env: dict[str, str]) -> tuple[int, str]:
+    result = subprocess.run(
+        [BASH or "bash", script.as_posix()],
+        cwd=cwd,
+        env={**os.environ, **env},
+        capture_output=True,
+        check=False,
+    )
+    return result.returncode, rc._text(result.stdout + result.stderr)
 
 
 # System32's bash.exe is WSL's, which cannot run the Windows git and python.
@@ -1959,7 +1970,8 @@ class ActionStepTests(unittest.TestCase):
         )
         (shim / "python").chmod(0o755)
         cls.script = cls.tmp / "step.sh"
-        cls.script.write_text(action_step_script(), encoding="utf-8", newline="\n")
+        step = run_block(THIS_DIR / "action.yml", "Scan for private-content shapes")
+        cls.script.write_text(step, encoding="utf-8", newline="\n")
         (cls.tmp / "upstream").mkdir()
         up = ScratchRepo(str(cls.tmp / "upstream"))
         cls.base = up.head()
@@ -1972,52 +1984,118 @@ class ActionStepTests(unittest.TestCase):
         git_out(self.tmp, "clone", "-q", self.url, str(runner))
         return runner
 
-    def run_step(self, cwd: Path, **env: str) -> tuple[int, str]:
+    def run_step(self, cwd: Path, **env: str) -> tuple[int, str, dict[str, str]]:
+        """Run the step in cwd. Returns its exit code, output and step outputs."""
         outputs = Path(tempfile.mkdtemp(dir=self.tmp)) / "github_output"
-        step_env = {
-            **os.environ,
-            "PATH": str(self.tmp / "bin") + os.pathsep + os.environ["PATH"],
-            "FAIL_ON": "match",
-            "SCAN_MODE": "added-lines",
-            "PATTERNS_FILE": "",
-            "SKIP_SCANNER_FILES": "false",
-            "BASE_REF": "",
-            "PR_BASE_REF": "",
-            "PR_HEAD_SHA": "",
-            "GITHUB_OUTPUT": outputs.as_posix(),
-            "RUNNER_TEMP": self.tmp.as_posix(),
-            **env,
-        }
-        result = subprocess.run(
-            [BASH, self.script.as_posix()],
-            cwd=cwd,
-            env=step_env,
-            capture_output=True,
-            check=False,
+        outputs.touch()
+        code, out = run_bash(
+            self.script,
+            cwd,
+            {
+                "PATH": str(self.tmp / "bin") + os.pathsep + os.environ["PATH"],
+                "FAIL_ON": "match",
+                "SCAN_MODE": "added-lines",
+                "PATTERNS_FILE": "",
+                "SKIP_SCANNER_FILES": "false",
+                "BASE_REF": "",
+                "PR_BASE_REF": "",
+                "PR_HEAD_SHA": "",
+                "GITHUB_OUTPUT": outputs.as_posix(),
+                "RUNNER_TEMP": self.tmp.as_posix(),
+                **env,
+            },
         )
-        return result.returncode, rc._text(result.stdout + result.stderr)
+        lines = outputs.read_text(encoding="utf-8").splitlines()
+        return code, out, dict(ln.split("=", 1) for ln in lines if "=" in ln)
 
     def test_a_base_ref_that_looks_like_an_option_runs_no_command(self):
         # Over a file or ssh remote, git fetch ran --upload-pack's command.
         runner = self.clone()
         base_ref = "--upload-pack=touch${IFS}INJECTED;git-upload-pack"
-        code, out = self.run_step(runner, BASE_REF=base_ref)
+        code, out, _outputs = self.run_step(runner, BASE_REF=base_ref)
         self.assertEqual(code, 2, out)
         self.assertIn("::error::base-ref cannot start with '-'", out)
         self.assertFalse((runner / "INJECTED").exists())
 
     def test_a_base_ref_with_a_newline_cannot_forge_a_command(self):
         runner = self.clone()
-        code, out = self.run_step(runner, BASE_REF="main\n::warning::forged")
+        code, out, _outputs = self.run_step(runner, BASE_REF="main\n::warning::x")
         self.assertEqual(code, 2, out)
         self.assertNotIn("\n::warning::", "\n" + out)
 
-    def test_a_commit_sha_base_ref_is_scanned(self):
-        code, out = self.run_step(self.clone(), BASE_REF=self.base)
+    def test_the_step_reports_its_exit_code_and_output(self):
+        # ci.yml asserts on these. A step outcome alone could not tell a
+        # finding (1) from a scan that never ran (2).
+        runner = self.clone()
+        code, out, outputs = self.run_step(runner, BASE_REF=self.base)
         self.assertEqual(code, 1, out)
+        self.assertEqual(outputs["exit-code"], "1")
+        report = Path(outputs["report"]).read_text(encoding="utf-8")
         self.assertEqual(
-            FINDING_RE.findall(out), [("notes.txt", "private/link-local IP")]
+            FINDING_RE.findall(report), [("notes.txt", "private/link-local IP")]
         )
+        code, out, outputs = self.run_step(runner, BASE_REF="")
+        self.assertEqual((code, outputs["exit-code"]), (2, "2"), out)
+
+
+@unittest.skipUnless(BASH, "needs bash, as a runner has")
+class CISelfTestTests(unittest.TestCase):
+    """ci.yml's self-test assertions, run on the outputs they check."""
+
+    CI = THIS_DIR / ".github" / "workflows" / "ci.yml"
+    DIRTY = "a" * 40
+
+    def check(self, step_name: str, report_text: str, **env: str) -> int:
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "assert.sh"
+            block = run_block(self.CI, step_name)
+            script.write_text(block, encoding="utf-8", newline="\n")
+            report = Path(tmp) / "report"
+            report.write_text(report_text, encoding="utf-8")
+            env = {"REPORT": report.as_posix(), "DIRTY_SHA": self.DIRTY, **env}
+            code, _out = run_bash(script, Path(tmp), env)
+        return code
+
+    def finding(self, commit: str = "") -> str:
+        added = f" added in commit {commit[:12]}" if commit else ""
+        return (
+            "::error file=.fixture/probe.txt,line=2::Possible absolute home path"
+            f"{added}: hmac:0123456789ab (masked, not the real value).\n"
+        )
+
+    def test_the_dirty_run_must_exit_1_and_name_the_fixture(self):
+        step = "Assert the dirty fixture was caught"
+        self.assertEqual(self.check(step, self.finding(), EXIT_CODE="1"), 0)
+        # A scan that cannot run also fails the step, and used to pass here.
+        self.assertNotEqual(self.check(step, self.finding(), EXIT_CODE="2"), 0)
+        self.assertNotEqual(
+            self.check(step, "Redaction gate: clean.\n", EXIT_CODE="1"), 0
+        )
+
+    def test_the_history_run_must_name_the_dirty_commit(self):
+        step = "Assert the finding names the commit that added the shape"
+        found = self.finding(self.DIRTY)
+        self.assertEqual(self.check(step, found, EXIT_CODE="1"), 0)
+        other = self.finding("b" * 40)
+        self.assertNotEqual(self.check(step, other, EXIT_CODE="1"), 0)
+        self.assertNotEqual(self.check(step, found, EXIT_CODE="2"), 0)
+
+    def test_the_clean_run_must_exit_0(self):
+        step = "Assert the clean fixture passed"
+        self.assertEqual(self.check(step, "", EXIT_CODE="0"), 0)
+        self.assertNotEqual(self.check(step, "", EXIT_CODE="2"), 0)
+
+    def test_pull_requests_scan_the_untouched_test_merge(self):
+        # The fixture commits sit on top of the test merge, so without this
+        # step CI never ran the first-parent range a pull request takes.
+        text = self.CI.read_text(encoding="utf-8")
+        untouched = text.index("- name: Run the action on the untouched checkout")
+        fixture = text.index("- name: Add a fixture commit")
+        step = text[untouched:fixture]
+        self.assertLess(untouched, fixture)
+        self.assertIn("if: github.event_name == 'pull_request'", step)
+        self.assertIn("uses: ./", step)
+        self.assertNotIn("continue-on-error", step)
 
 
 class SelftestTests(unittest.TestCase):

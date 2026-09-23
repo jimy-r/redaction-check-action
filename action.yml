@@ -53,6 +53,19 @@ inputs:
     required: false
     default: 'false'
 
+outputs:
+  exit-code:
+    description: >-
+      The scan's exit code. 0 means clean, or findings under fail-on none.
+      1 means findings. 2 means the scan could not run, such as a base-ref
+      it cannot use or a diff it cannot compute.
+    value: ${{ steps.scan.outputs.exit-code }}
+  report:
+    description: >-
+      Path to a file on the runner that holds the scanner's output, the
+      same masked findings the log shows.
+    value: ${{ steps.scan.outputs.report }}
+
 runs:
   using: composite
   steps:
@@ -62,6 +75,7 @@ runs:
         python-version: '3.12'
 
     - name: Scan for private-content shapes
+      id: scan
       shell: bash
       env:
         PATTERNS_FILE: ${{ inputs.patterns-file }}
@@ -73,6 +87,13 @@ runs:
         SKIP_SCANNER_FILES: ${{ inputs.skip-scanner-files }}
       run: |
         set -euo pipefail
+        # The scanner's output also goes to a file, the report output, and
+        # the exit-code output is set however the step ends.
+        report=$(mktemp "${RUNNER_TEMP:-/tmp}/redaction-check.XXXXXX")
+        trap 'status=$?; if [ -n "${GITHUB_OUTPUT:-}" ]; then printf "exit-code=%s\nreport=%s\n" "$status" "$report" >> "$GITHUB_OUTPUT"; fi' EXIT
+        scan() {
+          python "${{ github.action_path }}/redaction_check.py" "$@" | tee -a "$report"
+        }
         args=(--fail-on "$FAIL_ON")
         if [ -n "$PATTERNS_FILE" ]; then
           args+=(--patterns-file "$PATTERNS_FILE")
@@ -82,11 +103,11 @@ runs:
         fi
 
         if [ "$SCAN_MODE" = "all-files" ]; then
-          python "${{ github.action_path }}/redaction_check.py" --mode all-files "${args[@]}"
+          scan --mode all-files "${args[@]}"
         else
           if [ -z "$BASE_REF" ]; then
             echo "::error::scan-mode is added-lines but no base ref is available. Set the base-ref input, or trigger this action on pull_request."
-            exit 1
+            exit 2
           fi
           # Before any git call. git fetch reads a value that starts with "-"
           # as an option, and --upload-pack=<command> runs that command over a
@@ -124,6 +145,5 @@ runs:
           if [ -n "$PR_HEAD_SHA" ] && [ "$BASE_REF" = "$PR_BASE_REF" ]; then
             args+=(--pr-head "$PR_HEAD_SHA")
           fi
-          python "${{ github.action_path }}/redaction_check.py" --mode added-lines \
-            --base "$base" "${args[@]}"
+          scan --mode added-lines --base "$base" "${args[@]}"
         fi
