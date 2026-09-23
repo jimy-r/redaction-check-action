@@ -135,9 +135,12 @@ IP_ALLOW = {"169.254.169.254"}
 
 # mDNS-style local hostnames (e.g. jamespc.local) often carry a real device
 # or user name. Same placeholder logic as the home-path check, plus a few
-# generic words common in networking docs.
+# generic words common in networking docs. An mDNS name ends at `.local`, so
+# the lookahead skips a `.local.` segment inside a filename such as
+# settings.local.json or docker-compose.local.yml. A sentence-final
+# `host.local.` still matches, because nothing follows that dot.
 LOCAL_HOSTNAME_RE = re.compile(
-    r"\b([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)\.local\b"
+    r"\b([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)\.local\b(?!\.[A-Za-z0-9])"
 )
 HOSTNAME_PLACEHOLDERS = PATH_PLACEHOLDERS | {
     "test",
@@ -399,6 +402,7 @@ def run_selftest() -> int:
         "key " + "AKIA" + "EXAMPLE000000000" + " here",
         "internal host at 192.168" + ".1.42",
         "reachable at build7" + ".local on the LAN",
+        "the share lives on build7" + ".local.",
     ]
     must_pass = [
         "see /home/alice/project for the example",
@@ -408,6 +412,7 @@ def run_selftest() -> int:
         "reference ~/.claude/settings.json (generic)",
         "loopback is 127.0.0.1 in every stack",
         "runs fine on runner" + ".local for CI",
+        "copy .claude/settings" + ".local.json over the defaults",
     ]
     ok = True
     for s in must_flag:

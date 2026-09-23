@@ -214,6 +214,31 @@ class LocalHostnameTests(unittest.TestCase):
     def test_localhost_local_is_allowed(self):
         self.assertEqual(rc.scan_line("bind to localhost.local in dev"), [])
 
+    def test_local_segment_inside_a_filename_is_not_a_hostname(self):
+        # An mDNS name ends at .local, so a further dotted part is a file
+        # extension. Claude Code's per-user settings.local.json was the
+        # false positive that forced a redaction-ok marker onto real docs.
+        for name in [
+            "settings.local.json",
+            ".claude/settings.local.json",
+            "docker-compose.local.yml",
+            "config.local.toml",
+        ]:
+            with self.subTest(name=name):
+                self.assertEqual(rc.scan_line(f"copy {name} over the defaults"), [])
+
+    def test_hostname_followed_by_punctuation_is_still_flagged(self):
+        # The lookahead only skips `.local.` when the dot is followed by a
+        # letter or digit, so a full stop or a port does not hide a host.
+        for line in [
+            "the share lives on " + "build7.local" + ".",
+            "the share lives on " + "build7.local" + ". Mount it first.",
+            "mount it from " + "build7.local" + ":/srv/share",
+        ]:
+            with self.subTest(line=line):
+                hits = rc.scan_line(line)
+                self.assertEqual([label for label, _ in hits], ["mDNS/.local hostname"])
+
 
 # ---------------------------------------------------------------------------
 # Secret-like filenames (checked once per file, not per line)
