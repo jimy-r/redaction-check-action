@@ -11,6 +11,7 @@ also excluded from the scanner's own findings for the same reason.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import os
 import re
@@ -405,6 +406,29 @@ class MaskingTests(unittest.TestCase):
 
     def test_mask_differs_for_different_secrets(self):
         self.assertNotEqual(rc.mask(self.SECRETS[0]), rc.mask(self.SECRETS[1]))
+
+    def test_mask_is_not_a_plain_hash_of_the_secret(self):
+        # An unsalted hash was reversible from the log alone: hashing 10/8
+        # recovered a masked private IP in about two seconds.
+        for secret in self.SECRETS:
+            with self.subTest(secret=secret):
+                plain = hashlib.sha256(secret.encode()).hexdigest()
+                self.assertNotIn(plain[:12], rc.mask(secret))
+
+    def test_each_run_masks_with_a_fresh_key(self):
+        code = f"import redaction_check as rc; print(rc.mask({IP!r}))"
+        tags = {
+            subprocess.run(
+                [sys.executable, "-c", code],
+                cwd=THIS_DIR,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            for _ in range(2)
+        }
+        self.assertEqual(len(tags), 2, tags)
+        self.assertTrue(all(re.fullmatch(r"hmac:[0-9a-f]{12}", t) for t in tags))
 
     def test_findings_from_scan_added_lines_never_contain_the_raw_secret(self):
         diff = (
@@ -1397,7 +1421,7 @@ class RewrittenBaseTests(unittest.TestCase):
 # (path, label) for every finding, whether or not it names a commit.
 FINDING_RE = re.compile(
     r"^::error file=(.*),line=\d+::Possible (.+?)"
-    r"(?: added in commit [0-9a-f]{12})?: sha256:",
+    r"(?: added in commit [0-9a-f]{12})?: hmac:",
     re.M,
 )
 # (path, label, short SHA) for the findings that come from one commit.

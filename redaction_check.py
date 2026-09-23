@@ -9,7 +9,7 @@ each of its commits on its own are scanned. High-confidence patterns only --
 a noisy gate that false-positives on ordinary prose gets disabled, which is
 worse than no gate at all.
 
-Every finding is reported with the matched text MASKED (a short hash, never
+Every finding is reported with the matched text MASKED (a keyed hash, never
 the raw substring), so the gate's own output -- which lands in a CI log that
 may be public -- cannot itself leak the thing it caught.
 
@@ -32,7 +32,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import re
+import secrets
 import subprocess
 import sys
 from collections.abc import Callable, Collection, Iterable, Iterator
@@ -267,15 +269,23 @@ class Finding:
     commit: str = ""  # set when the line came from one commit's own patch
 
 
-def mask(secret: str) -> str:
-    """Collapse a matched secret to a short hash. Never return the raw text.
+# The mask key, random and fresh for each run, and never printed. An unsalted
+# hash of a value with few possibilities could be reversed from the log alone:
+# hashing all of 10/8 recovered a masked private IP in about two seconds.
+MASK_KEY = secrets.token_bytes(32)
 
-    The hash lets two findings of the same secret be recognised as the same
-    without ever printing anything recoverable -- the point is that this
-    scanner's own output can land in a CI log that may be public.
+
+def mask(secret: str) -> str:
+    """Collapse a matched secret to a short keyed hash. Never return the raw text.
+
+    Within one run the same secret always gives the same tag, so two findings
+    of it can be recognised as the same and merge_findings can dedupe them.
+    Without the key nobody can recompute a tag from guesses, and tags from
+    different runs cannot be linked. The point is that this scanner's own
+    output can land in a CI log that may be public.
     """
-    digest = hashlib.sha256(secret.encode("utf-8", "replace")).hexdigest()
-    return f"sha256:{digest[:12]}"
+    tag = hmac.new(MASK_KEY, secret.encode("utf-8", "replace"), hashlib.sha256)
+    return f"hmac:{tag.hexdigest()[:12]}"
 
 
 def check_filename(path: str) -> str | None:

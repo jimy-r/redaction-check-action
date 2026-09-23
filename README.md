@@ -84,7 +84,7 @@ jobs:
 
 ## The masking guarantee
 
-A finding never prints the thing it caught. Every match collapses to a short SHA-256 prefix (`sha256:9f2a1b3c4d5e`) before it reaches the log, so a run on a public repo can't itself become the leak. The test suite confirms this directly. The raw matched text is asserted absent from every code path that produces output, across every pattern class, checked in code rather than trusted by eye.
+A finding never prints the thing it caught. Every match collapses to a short keyed hash (`hmac:9f2a1b3c4d5e`, HMAC-SHA256) before it reaches the log, so a run on a public repo can't itself become the leak. The key is random, made fresh for each run and never printed. The same value gets the same tag within a run, so repeats line up, but nobody can recompute a tag from guesses, even for a value with few possibilities like a private IP, and tags from two runs can't be matched up. The test suite confirms this directly. The raw matched text is asserted absent from every code path that produces output, across every pattern class, checked in code rather than trusted by eye.
 
 ## Suppressing a false positive
 
