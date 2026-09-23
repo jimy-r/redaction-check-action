@@ -959,6 +959,47 @@ class MovedBaseTests(unittest.TestCase):
             rc.resolve_diff_range("origin/main", runner)
         self.assertIn("does not name a commit", str(ctx.exception))
 
+    def checkout_base_tip(self, depth: int | None = None) -> str:
+        """Check out main's tip, as pull_request_target does by default."""
+        runner = Path(tempfile.mkdtemp(dir=self.tmp))
+        git_out(runner, "init", "-q")
+        git_out(runner, "remote", "add", "origin", self.url)
+        if depth is None:  # every branch, so the pull request head is present
+            args = ["origin", "+refs/heads/*:refs/remotes/origin/*"]
+        else:
+            args = [
+                f"--depth={depth}",
+                "origin",
+                "+refs/heads/main:refs/remotes/origin/main",
+            ]
+        git_out(runner, "fetch", "-q", "--no-tags", *args)
+        git_out(runner, "checkout", "-q", "--detach", "refs/remotes/origin/main")
+        return str(runner)
+
+    def test_checkout_without_the_pull_request_head_is_an_error(self):
+        # The fallback used to diff the base branch against itself here and
+        # report clean, whether or not the head commit was in the clone.
+        for depth in [None, 1]:
+            with self.subTest(depth=depth):
+                runner = self.checkout_base_tip(depth)
+                argv = ["--base", "origin/main", "--root", runner]
+                code, out, _err = run_main([*argv, "--pr-head", self.pr_head])
+                self.assertEqual(code, 2)
+                self.assertIn("does not contain pull request head", out)
+                self.assertNotIn("clean", out)
+
+    def test_checkout_that_descends_from_the_pull_request_head_is_scanned(self):
+        # A checkout of a head newer than the event's head.sha still holds it.
+        runner = self.checkout()
+        git_out(runner, "checkout", "-q", "--detach", self.pr_head)
+        (Path(runner) / "later.txt").write_text("later\n", encoding="utf-8")
+        git_out(runner, "add", "later.txt")
+        identity = ["-c", "user.email=test@example.com", "-c", "user.name=test"]
+        git_out(runner, *identity, "commit", "-qm", "later")
+        frm, _to, how = rc.resolve_diff_range("origin/main", runner, self.pr_head)
+        self.assertEqual(frm, self.base_tip)
+        self.assertIn("merge base", how)
+
     def test_head_that_does_not_merge_pr_head_falls_back_to_the_merge_base(self):
         # A caller that checks out the pull request head itself, not the
         # merge ref, still gets the pull request's changes.

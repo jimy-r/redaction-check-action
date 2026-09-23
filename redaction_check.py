@@ -458,6 +458,17 @@ def resolve_diff_range(
                 return widened
             how = "the pull request's test-merge commit against its first parent"
             return first_parent, head_sha, how
+        # Anything else must at least contain the pull request's head, or the
+        # merge-base range below scans some other change. pull_request_target
+        # checks out the base branch by default, and that range is then empty.
+        contains = _git(root, "merge-base", "--is-ancestor", pr_head.strip(), head_sha)
+        if contains.returncode != 0:
+            raise DiffError(
+                f"HEAD does not contain pull request head {pr_head[:12]}, so this "
+                "checkout is not the pull request's code. A pull_request_target "
+                "run checks out the base branch unless told otherwise. Check out "
+                "the pull request's head or merge commit."
+            )
         how += f", since HEAD does not merge pull request head {pr_head[:12]}"
 
     base_commit = _git(root, "rev-parse", "--verify", f"{base}^{{commit}}")
