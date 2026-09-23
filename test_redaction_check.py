@@ -580,6 +580,29 @@ class DiffParsingTests(unittest.TestCase):
             list(rc.parse_added_lines(diff)), [("f.txt", 1, "one\rtwo\fthree four")]
         )
 
+    def test_added_line_shaped_like_a_header_is_content(self):
+        # A file whose first line is "++ /dev/null" shows up in a hunk as
+        # "+++ /dev/null". Read as a header, it ended the file, and every
+        # added line after it went unscanned.
+        diff = (
+            "diff --git a/pp.txt b/pp.txt\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/pp.txt\n"
+            "@@ -0,0 +1,3 @@\n"
+            "+++ /dev/null\n"
+            "+++ b/elsewhere.txt\n"
+            "+host " + "10.20.30.40" + "\n"
+        )
+        self.assertEqual(
+            list(rc.parse_added_lines(diff)),
+            [
+                ("pp.txt", 1, "++ /dev/null"),
+                ("pp.txt", 2, "++ b/elsewhere.txt"),
+                ("pp.txt", 3, "host " + "10.20.30.40"),
+            ],
+        )
+
     def test_a_diff_saved_with_crlf_still_parses(self):
         diff = "diff --git a/.env b/.env\r\n--- /dev/null\r\n+++ b/.env\r\n@@ -0,0 +1 @@\r\n+K=v\r\n"
         got = [(path, lineno) for path, lineno, _ in rc.parse_added_lines(diff)]
@@ -1259,6 +1282,13 @@ class GitDiffTests(unittest.TestCase):
         code, found = self.repo.scan()
         self.assertEqual(code, 1)
         self.assertEqual(sorted(found), [(n, "private/link-local IP") for n in files])
+
+    def test_file_whose_line_looks_like_a_header_is_scanned(self):
+        self.repo.write("pp.txt", f"++ /dev/null\nhost {IP}\n".encode())
+        self.repo.commit("add")
+        code, found = self.repo.scan()
+        self.assertEqual(code, 1)
+        self.assertEqual(found, [("pp.txt", "private/link-local IP")])
 
 
 class ActionDefinitionTests(unittest.TestCase):

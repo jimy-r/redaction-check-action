@@ -280,25 +280,33 @@ def parse_added_lines(diff_text: str) -> Iterator[tuple[str, int, str]]:
     Lines split on "\\n" only. A CR, a form feed or a U+2028 inside an added
     line is part of its content, never a break that would strip the "+" from
     the text after it and hide that text from the scan.
+
+    `---` and `+++` are file headers only between a `diff --git` line and
+    that file's first hunk. Inside a hunk, `+++ /dev/null` is an added line
+    whose text starts with "++ ", not a header that ends the file.
     """
     path: str | None = None
     lineno = 0
+    in_header = True  # a plain unified diff opens with ---/+++, no diff --git
     for line in diff_text.split("\n"):
         if DIFF_HEADER_RE.match(line):
             path = None  # each file block starts clean; no cross-file bleed
-            continue
-        if line.startswith("+++ "):
-            new_path = line[4:].rstrip("\r")  # a diff file saved with CRLF
-            if new_path == "/dev/null":
-                path = None
-            elif new_path.startswith("b/"):
-                path = new_path[2:]
-            else:
-                path = new_path
+            in_header = True
             continue
         if line.startswith("@@"):
             m = HUNK_RE.match(line)
             lineno = int(m.group(1)) if m else 0
+            in_header = False
+            continue
+        if in_header:
+            if line.startswith("+++ "):
+                new_path = line[4:].rstrip("\r")  # a diff file saved with CRLF
+                if new_path == "/dev/null":
+                    path = None
+                elif new_path.startswith("b/"):
+                    path = new_path[2:]
+                else:
+                    path = new_path
             continue
         if line.startswith("\\"):
             continue  # "\ No newline at end of file"
