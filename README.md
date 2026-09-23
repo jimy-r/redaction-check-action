@@ -39,6 +39,12 @@ jobs:
 
 `@v1` is a moving major tag, repointed at the newest `v1.x.y` on every release; it is not re-tagged for patch or minor bumps you'd need to review individually. Pin to a specific tag (`@v1.2.3`) or commit SHA instead if you want releases to land on your own schedule.
 
+### Earlier commits count too
+
+A line added in one commit and deleted in a later one never shows in the pull request's net diff. The commit that added it is still on the branch, though, and once pushed that commit is public. A merge commit or a rebase merge also carries it onto the base branch. So the scan reads each commit in the range on its own as well as the net diff, and a finding that only an earlier commit holds names that commit's SHA.
+
+A later commit that deletes the line doesn't clear that finding. Rewriting the branch without it does, with an interactive rebase and a force-push, because until then the commit stays public. GitHub can still serve the old commit by its SHA after that, so a real credential that reached a pushed commit should be treated as exposed and rotated. If the checkout is shallow and hides some of the pull request's commits, the action fetches their history from origin, and it fails rather than scan fewer.
+
 ### Running on push
 
 A push has no pull request base, so `base-ref` has to be set. On a push to `main`, don't set it to `main`. The checkout is then `main`'s own new tip, so the range from `main` to it is empty and the step passes without scanning a line. Pass the commit the push started from instead, which GitHub puts in `github.event.before`:

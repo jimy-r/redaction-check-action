@@ -105,7 +105,10 @@ runs:
           fi
           # On a pull_request event the checkout is GitHub's test-merge commit.
           # Given the head SHA, the scanner diffs that commit against its own
-          # first parent, which needs no merge base with the base branch.
+          # first parent, which needs no merge base with the base branch. It
+          # also scans each commit of the pull request on its own. If a
+          # shallow checkout hides some of them, the scanner fetches their
+          # history from origin, and the scan fails if any stay out of view.
           if [ -n "$PR_HEAD_SHA" ] && [ "$BASE_REF" = "$PR_BASE_REF" ]; then
             args+=(--pr-head "$PR_HEAD_SHA")
           fi

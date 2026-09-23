@@ -4,9 +4,10 @@
 Scans the ADDED lines of a pull request (or, in --mode all-files, every
 git-tracked file) for the *shapes* of private content: email addresses,
 absolute home paths, credential/token prefixes, private-IP/hostname shapes,
-and common secret-file names. High-confidence patterns only -- a noisy gate
-that false-positives on ordinary prose gets disabled, which is worse than no
-gate at all.
+and common secret-file names. With --base, both the range's net diff and
+each of its commits on its own are scanned. High-confidence patterns only --
+a noisy gate that false-positives on ordinary prose gets disabled, which is
+worse than no gate at all.
 
 Every finding is reported with the matched text MASKED (a short hash, never
 the raw substring), so the gate's own output -- which lands in a CI log that
@@ -35,7 +36,7 @@ import re
 import subprocess
 import sys
 from collections.abc import Collection, Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 # Inline marker that suppresses a scan on the line it appears on. Documented
@@ -209,6 +210,7 @@ class Finding:
     line: int
     label: str
     masked: str
+    commit: str = ""  # set when the line came from one commit's own patch
 
 
 def mask(secret: str) -> str:
@@ -283,8 +285,11 @@ def load_extra_patterns(path: str) -> list[tuple[str, re.Pattern[str]]]:
 # Diff parsing
 # ---------------------------------------------------------------------------
 
-DIFF_HEADER_RE = re.compile(r"^diff --git ")
-HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+# `diff --cc` and `diff --combined` open a merge commit's combined diff in
+# `git log --cc` output. Its hunk header carries one `@` more than the merge
+# has parents (`@@@ -1 -1 +1,2 @@@` for two), and one old range per parent.
+DIFF_HEADER_RE = re.compile(r"^diff --(?:git|cc|combined) ")
+HUNK_RE = re.compile(r"^(@{2,}) (?:-\d+(?:,\d+)? )+\+(\d+)(?:,\d+)? \1(?:\s|$)")
 
 # Git's C-style escapes inside a quoted path. An octal escape is one byte.
 C_ESCAPE_RE = re.compile(r"\\(?:([0-7]{3})|(.))", re.DOTALL)
@@ -344,9 +349,14 @@ def parse_added_lines(diff_text: str) -> Iterator[tuple[str, int, str]]:
     `---` and `+++` are file headers only between a `diff --git` line and
     that file's first hunk. Inside a hunk, `+++ /dev/null` is an added line
     whose text starts with "++ ", not a header that ends the file.
+
+    In a merge commit's combined diff each line opens with one mark per
+    parent. Only a line marked `+` against every parent, one that no parent
+    had, is yielded. A line one parent already had came from that parent.
     """
     path: str | None = None
     lineno = 0
+    parents = 1
     in_header = True  # a plain unified diff opens with ---/+++, no diff --git
     for line in diff_text.split("\n"):
         if DIFF_HEADER_RE.match(line):
@@ -355,7 +365,8 @@ def parse_added_lines(diff_text: str) -> Iterator[tuple[str, int, str]]:
             continue
         if line.startswith("@@"):
             m = HUNK_RE.match(line)
-            lineno = int(m.group(1)) if m else 0
+            parents = len(m.group(1)) - 1 if m else 1
+            lineno = int(m.group(2)) if m else 0
             in_header = False
             continue
         if in_header:
@@ -373,13 +384,14 @@ def parse_added_lines(diff_text: str) -> Iterator[tuple[str, int, str]]:
             continue  # "\ No newline at end of file"
         if path is None:
             continue
-        if line.startswith("+"):
-            yield path, lineno, line[1:]
-            lineno += 1
-        elif line.startswith("-"):
-            continue  # old-side-only line; new-file line counter untouched
-        elif line.startswith(" "):
-            lineno += 1  # context line present; advances but is not added
+        marks = line[:parents]
+        if len(marks) < parents or marks.strip("+- "):
+            continue  # not a hunk line
+        if "-" in marks:
+            continue  # a line only a parent has; new-file line counter untouched
+        if marks == "+" * parents:
+            yield path, lineno, line[parents:]
+        lineno += 1  # an added line, or context present; either is in the new file
 
 
 # Git's output is captured as bytes and decoded by _text, never by subprocess.
@@ -618,6 +630,192 @@ def git_added_paths(from_commit: str, to_commit: str, root: str = ".") -> list[s
     return [name for name in _text(result.stdout).split("\0") if name]
 
 
+def _shallow_boundaries(root: str) -> set[str]:
+    """Return the commits a shallow clone cuts history off at, or none."""
+    shallow = _git(root, "rev-parse", "--is-shallow-repository")
+    if _text(shallow.stdout).strip() != "true":
+        return set()
+    where = _text(_git(root, "rev-parse", "--git-path", "shallow").stdout).strip()
+    try:
+        return set((Path(root) / where).read_text(encoding="ascii").split())
+    except OSError as exc:
+        raise DiffError(
+            f"this clone is shallow and its list of cut-off commits is unreadable ({exc})."
+        ) from exc
+
+
+def commits_in_range(from_commit: str, to_commit: str, root: str = ".") -> list[str]:
+    result = _git(root, "rev-list", f"{from_commit}..{to_commit}")
+    if result.returncode != 0:
+        raise DiffError(
+            f"cannot list the commits in {from_commit[:12]}..{to_commit[:12]}: "
+            f"{_last_error_line(result)}"
+        )
+    return _text(result.stdout).split()
+
+
+def require_visible_commits(
+    from_commit: str, to_commit: str, root: str = "."
+) -> list[str]:
+    """Return the commits in from..to once none of them hides its parents.
+
+    A commit on a shallow clone's boundary has parents the clone lacks, so
+    earlier commits of the range may sit behind it out of view. Their history
+    is then fetched from origin in full, once. A fetch limited by depth would
+    not do: it writes a new boundary even on a commit whose parents the clone
+    already has, which cuts the base branch's history off and puts the base's
+    own commits in the range. If a boundary is still in the range, DiffError
+    says so rather than letting the scan read fewer commits than it holds.
+    """
+    commits = commits_in_range(from_commit, to_commit, root)
+    boundaries = _shallow_boundaries(root)
+    cut = [sha for sha in commits if sha in boundaries]
+    detail = ""
+    if cut:
+        fetch = _git(root, "fetch", "--no-tags", "--unshallow", "origin", *cut)
+        if fetch.returncode:
+            detail = f" Fetching their history failed: {_last_error_line(fetch)}"
+        commits = commits_in_range(from_commit, to_commit, root)
+        boundaries = _shallow_boundaries(root)
+        cut = [sha for sha in commits if sha in boundaries]
+    if cut:
+        raise DiffError(
+            f"{len(cut)} commit(s) in {from_commit[:12]}..{to_commit[:12]}, such as "
+            f"{cut[0][:12]}, sit on this shallow clone's boundary, so commits "
+            "before them are out of view and cannot be scanned. Check out with "
+            f"fetch-depth: 0.{detail}"
+        )
+    return commits
+
+
+def _git_log(root: str, from_commit: str, to_commit: str, *output: str) -> str:
+    """Run `git log` over from..to, oldest commit first, each opened by a marker.
+
+    --cc gives a merge commit its combined diff, which shows the lines no
+    parent had. --root keeps a parentless commit's patch whatever log.showRoot
+    says. The diff flags match git_diff's.
+    """
+    result = _git(
+        root,
+        "-c",
+        "core.quotePath=false",
+        "log",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--root",
+        "--cc",
+        "--topo-order",
+        "--reverse",
+        "--format=%x00%H",
+        *output,
+        f"{from_commit}..{to_commit}",
+    )
+    if result.returncode != 0:
+        raise DiffError(f"git log failed: {_last_error_line(result)}")
+    return _text(result.stdout)
+
+
+def _split_log(log_text: str) -> list[tuple[str, str]]:
+    """Split _git_log output into (commit, body) pairs.
+
+    Each commit opens with a line that starts with a NUL byte. No diff line
+    can: every one starts with a mark or a header word.
+    """
+    commits = []
+    for chunk in ("\n" + log_text).split("\n\0")[1:]:
+        sha, _, body = chunk.partition("\n")
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
+            raise DiffError(
+                f"git log printed an unreadable commit marker: {sha[:40]!r}"
+            )
+        commits.append((sha, body))
+    return commits
+
+
+def git_commit_patches(
+    from_commit: str, to_commit: str, root: str = "."
+) -> list[tuple[str, str]]:
+    """Return (commit, patch) for each commit in from..to, oldest first."""
+    log = _git_log(root, from_commit, to_commit, "-p", "--text", "--unified=0")
+    return _split_log(log)
+
+
+def git_commit_added_paths(
+    from_commit: str, to_commit: str, root: str = "."
+) -> dict[str, list[str]]:
+    """Return, for each commit in from..to, the paths it adds, renames or copies to.
+
+    For a merge commit, only a path that none of its parents had.
+    """
+    log = _git_log(root, from_commit, to_commit, "--name-status")
+    added: dict[str, list[str]] = {}
+    for sha, body in _split_log(log):
+        paths = added.setdefault(sha, [])
+        for line in body.split("\n"):
+            status, _, names = line.partition("\t")
+            if not names:
+                continue
+            letters = status.rstrip("0123456789")  # R100, C75: similarity score
+            if len(letters) == 1:
+                new = letters in ("A", "C", "R")
+            else:  # a merge: one letter per parent, A where that parent lacks it
+                new = bool(letters) and set(letters) == {"A"}
+            if new:
+                paths.append(unquote_header_path(names.split("\t")[-1]))
+    return added
+
+
+def scan_commits(
+    from_commit: str,
+    to_commit: str,
+    root: str = ".",
+    extra_patterns: Iterable[tuple[str, re.Pattern[str]]] = (),
+    skip_paths: Collection[str] = frozenset(),
+) -> tuple[list[Finding], int]:
+    """Scan each commit in from..to on its own, oldest first.
+
+    A line one commit adds and a later one removes never shows in the net
+    diff, but the commit that added it stays in the branch's history, which
+    is public once pushed, and a merge commit or a rebase merge carries it
+    onto the base branch. Returns the findings, each naming its commit, and
+    the number of commits in the range.
+    """
+    commits = require_visible_commits(from_commit, to_commit, root)
+    patches = git_commit_patches(from_commit, to_commit, root)
+    if sorted(sha for sha, _ in patches) != sorted(commits):
+        raise DiffError(
+            f"git log did not print every commit in {from_commit[:12]}..{to_commit[:12]}, "
+            "so they could not all be scanned."
+        )
+    added = git_commit_added_paths(from_commit, to_commit, root)
+    findings = []
+    for sha, patch in patches:
+        paths = added.get(sha, ())
+        for f in scan_added_lines(patch, extra_patterns, paths, skip_paths):
+            findings.append(replace(f, commit=sha))
+    return findings, len(commits)
+
+
+def merge_findings(net: list[Finding], history: list[Finding]) -> list[Finding]:
+    """Add each commit finding the net diff does not already report.
+
+    A value the net diff reports is still in the change, and that finding
+    already blocks it. Any other value is reported once, at the earliest
+    commit that added it, since that commit is what keeps it in history.
+    """
+    reported = {(f.label, f.masked) for f in net}
+    first_commit: dict[tuple[str, str], str] = {}
+    merged = list(net)
+    for f in history:
+        key = (f.label, f.masked)
+        if key in reported:
+            continue
+        if first_commit.setdefault(key, f.commit) == f.commit:
+            merged.append(f)
+    return merged
+
+
 def get_diff_via_git(base: str, root: str = ".", pr_head: str | None = None) -> str:
     """Return the --unified=0 diff of the lines HEAD adds; see resolve_diff_range."""
     from_commit, to_commit, _how = resolve_diff_range(base, root, pr_head)
@@ -759,6 +957,16 @@ def run_selftest() -> int:
 def report(findings: list[Finding], fail_on: str) -> int:
     level = "error" if fail_on == "match" else "warning"
     for f in findings:
+        if f.commit:
+            print(
+                f"::{level} file={f.path},line={f.line}::"
+                f"Possible {f.label} added in commit {f.commit[:12]}: {f.masked} "
+                f"(masked, not the real value). A later commit that removes it "
+                f"leaves it in the branch's history, so rewrite the branch without "
+                f"it, or mark the line in that commit with `{SUPPRESS_MARKER}` if "
+                f"it is a deliberate placeholder."
+            )
+            continue
         print(
             f"::{level} file={f.path},line={f.line}::"
             f"Possible {f.label}: {f.masked} (masked, not the real value). "
@@ -847,6 +1055,7 @@ def main(argv: list[str] | None = None) -> int:
         findings = scan_all_files(args.root, extra_patterns, skip_paths)
     else:
         added_paths: list[str] = []
+        history: list[Finding] = []
         if args.base:
             try:
                 from_commit, to_commit, how = resolve_diff_range(
@@ -854,13 +1063,17 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 diff_text = git_diff(from_commit, to_commit, args.root)
                 added_paths = git_added_paths(from_commit, to_commit, args.root)
+                history, commit_count = scan_commits(
+                    from_commit, to_commit, args.root, extra_patterns, skip_paths
+                )
             except DiffError as exc:
                 print(f"::error::Redaction gate cannot compute the diff to scan. {exc}")
                 return 2
             print(
-                f"Scanning lines added in {from_commit[:12]}..{to_commit[:12]} ({how})."
+                f"Scanning lines added in {from_commit[:12]}..{to_commit[:12]} ({how}), "
+                f"and in each of its {commit_count} commit(s) on its own."
             )
-            if not diff_text.strip():
+            if not diff_text.strip() and not commit_count:
                 print(
                     "::notice::That range has no changes, so there was nothing to scan."
                 )
@@ -872,7 +1085,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             stdin_bytes = getattr(sys.stdin, "buffer", None)
             diff_text = _text(stdin_bytes.read()) if stdin_bytes else sys.stdin.read()
-        findings = scan_added_lines(diff_text, extra_patterns, added_paths, skip_paths)
+        net = scan_added_lines(diff_text, extra_patterns, added_paths, skip_paths)
+        findings = merge_findings(net, history)
 
     return report(findings, args.fail_on)
 

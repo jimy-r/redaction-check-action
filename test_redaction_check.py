@@ -567,6 +567,25 @@ class DiffParsingTests(unittest.TestCase):
     def test_empty_diff_yields_nothing(self):
         self.assertEqual(list(rc.parse_added_lines("")), [])
 
+    def test_combined_diff_yields_only_lines_no_parent_had(self):
+        # `git log --cc` shows a merge commit this way, one mark per parent.
+        # A line one parent already had came from that parent, not the merge.
+        diff = (
+            "diff --cc a.txt\n"
+            "index 1111111,2222222..3333333\n"
+            "--- a/a.txt\n"
+            "+++ b/a.txt\n"
+            "@@@ -4,0 -4,0 +4,3 @@@ three\n"
+            "++only the merge added this\n"
+            "+ the second parent had this\n"
+            " +the first parent had this\n"
+            "- -gone from both\n"
+        )
+        self.assertEqual(
+            list(rc.parse_added_lines(diff)),
+            [("a.txt", 4, "only the merge added this")],
+        )
+
     def test_only_a_newline_ends_a_line(self):
         # splitlines() also broke at CR, form feed and U+2028, and the text
         # after each break lost its "+" and was never scanned.
@@ -1307,7 +1326,17 @@ class RewrittenBaseTests(unittest.TestCase):
 # runner's git config says
 # ---------------------------------------------------------------------------
 
-FINDING_RE = re.compile(r"^::error file=(.*),line=\d+::Possible (.+?): sha256:", re.M)
+# (path, label) for every finding, whether or not it names a commit.
+FINDING_RE = re.compile(
+    r"^::error file=(.*),line=\d+::Possible (.+?)"
+    r"(?: added in commit [0-9a-f]{12})?: sha256:",
+    re.M,
+)
+# (path, label, short SHA) for the findings that come from one commit.
+COMMIT_FINDING_RE = re.compile(
+    r"^::error file=(.*),line=\d+::Possible (.+?) added in commit ([0-9a-f]{12}): ",
+    re.M,
+)
 IP = "10.20.30.40"
 
 
@@ -1337,8 +1366,15 @@ class ScratchRepo:
 
     def scan(self) -> tuple[int, list[tuple[str, str]]]:
         """Scan HEAD~1..HEAD through the CLI: exit code and (path, label) pairs."""
-        code, out, _err = run_main(["--base", "HEAD~1", "--root", str(self.path)])
+        code, out = self.run_cli("HEAD~1")
         return code, FINDING_RE.findall(out)
+
+    def run_cli(self, base: str) -> tuple[int, str]:
+        code, out, _err = run_main(["--base", base, "--root", str(self.path)])
+        return code, out
+
+    def head(self) -> str:
+        return git_out(self.path, "rev-parse", "HEAD")
 
 
 class GitDiffTests(unittest.TestCase):
@@ -1466,6 +1502,176 @@ class GitDiffTests(unittest.TestCase):
         code, found = self.repo.scan()
         self.assertEqual(code, 1)
         self.assertEqual(found, [("pp.txt", "private/link-local IP")])
+
+
+# ---------------------------------------------------------------------------
+# Each commit, not just the net diff
+# ---------------------------------------------------------------------------
+
+
+class PullRequestHistoryTests(unittest.TestCase):
+    """A pull request whose first commit adds a host and whose second removes it.
+
+    The net diff shows only the clean result, but the first commit stays in
+    the branch's history, public once pushed. Main has moved on five commits
+    since the branch point, and GitHub's test merge M is built on its tip.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls._tmp.cleanup)
+        cls.tmp = Path(cls._tmp.name).resolve()
+        (cls.tmp / "upstream").mkdir()
+        up = ScratchRepo(str(cls.tmp / "upstream"))
+        for i in range(3):
+            up.write(f"base{i}.txt", b"base\n")
+            up.commit(f"B{i}")
+        git_out(up.path, "checkout", "-q", "-b", "feature")
+        up.write("s.txt", f"host {IP}\n".encode())
+        up.commit("C1: add a host")
+        cls.leaking_commit = up.head()
+        up.write("s.txt", b"clean\n")
+        up.commit("C2: remove it")
+        cls.pr_head = up.head()
+        git_out(up.path, "checkout", "-q", "main")
+        for i in range(5):
+            up.write(f"main{i}.txt", b"main\n")
+            up.commit(f"X{i}")
+        git_out(up.path, "checkout", "-q", "--detach", "main")
+        git_out(up.path, "merge", "-q", "--no-ff", "-m", "M", cls.pr_head)
+        cls.merge = up.head()
+        git_out(up.path, "update-ref", "refs/pull/1/merge", cls.merge)
+        git_out(up.path, "checkout", "-q", "main")
+        cls.url = up.path.as_uri()
+
+    def checkout(self, depth: int | None = None) -> str:
+        """Check out M, then fetch main in full as the action does."""
+        runner = checkout_merge(self.tmp, self.url, self.merge, depth)
+        git_out(runner, "fetch", "-q", "--no-tags", "origin", "main")
+        return runner
+
+    def scan(self, runner: str) -> tuple[int, str]:
+        argv = ["--base", "origin/main", "--root", runner, "--pr-head", self.pr_head]
+        code, out, err = run_main(argv)
+        self.assertNotIn(IP, out + err)  # the masking guarantee holds here too
+        return code, out
+
+    def assert_flagged_at_the_leaking_commit(self, code: int, out: str) -> None:
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            COMMIT_FINDING_RE.findall(out),
+            [("s.txt", "private/link-local IP", self.leaking_commit[:12])],
+        )
+        self.assertEqual(len(FINDING_RE.findall(out)), 1)
+
+    def test_line_a_later_commit_removed_is_flagged_at_its_commit(self):
+        self.assert_flagged_at_the_leaking_commit(*self.scan(self.checkout()))
+
+    def test_shallow_clone_fetches_the_commits_it_hides(self):
+        # Depth 1 is actions/checkout's default. A fetch limited by depth
+        # would cut main's history off at M's first parent, where main's own
+        # commits would enter the range, so the history is fetched in full.
+        runner = self.checkout(depth=1)
+        self.assert_flagged_at_the_leaking_commit(*self.scan(runner))
+        self.assertEqual(
+            git_out(runner, "rev-parse", "--is-shallow-repository"), "false"
+        )
+
+    def test_commits_that_stay_hidden_are_an_error(self):
+        runner = self.checkout(depth=1)
+        # M's first parent is in view, the pull request's first commit is
+        # not, and origin is gone, so nothing can bring that commit back.
+        git_out(runner, "fetch", "-q", "--no-tags", "--deepen=1", "origin", self.merge)
+        git_out(runner, "remote", "set-url", "origin", (self.tmp / "gone").as_uri())
+        code, out = self.scan(runner)
+        self.assertEqual(code, 2)
+        self.assertIn("shallow clone's boundary", out)
+        self.assertIn("Fetching their history failed", out)
+        self.assertNotIn("clean", out)
+
+
+class CommitHistoryTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = ScratchRepo(tmp.name)
+
+    def test_value_still_in_the_change_is_reported_once(self):
+        self.repo.write("s.txt", f"host {IP}\n".encode())
+        self.repo.commit("add")
+        self.repo.write("t.txt", b"clean\n")
+        self.repo.commit("more")
+        code, out = self.repo.run_cli("HEAD~2")
+        self.assertEqual(code, 1)
+        self.assertEqual(FINDING_RE.findall(out), [("s.txt", "private/link-local IP")])
+        self.assertEqual(COMMIT_FINDING_RE.findall(out), [])
+
+    def test_secret_file_added_then_deleted_is_flagged_by_name(self):
+        self.repo.write("keys/.env.local", b"")
+        self.repo.commit("add an empty secret file")
+        added = self.repo.head()
+        git_out(self.repo.path, "rm", "-q", "keys/.env.local")
+        self.repo.commit("delete it")
+        code, out = self.repo.run_cli("HEAD~2")
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            COMMIT_FINDING_RE.findall(out),
+            [("keys/.env.local", "dotenv file", added[:12])],
+        )
+
+    def test_merge_commit_that_adds_a_line_no_parent_had_is_flagged(self):
+        # The pull request merges main in and slips a host into that merge,
+        # then deletes it. main's own host came from main, so it is not the
+        # pull request's to answer for.
+        path = self.repo.path
+        git_out(path, "checkout", "-q", "-b", "feature")
+        self.repo.write("f.txt", b"feature work\n")
+        self.repo.commit("F1")
+        git_out(path, "checkout", "-q", "main")
+        self.repo.write("m.txt", b"host " + b"10.20.30.41" + b"\n")
+        self.repo.commit("main moves on")
+        git_out(path, "checkout", "-q", "feature")
+        git_out(path, "merge", "-q", "--no-ff", "--no-commit", "main")
+        self.repo.write("evil.txt", b"host " + b"10.20.30.42" + b"\n")
+        self.repo.commit("merge main")
+        merge = self.repo.head()
+        git_out(path, "rm", "-q", "evil.txt")
+        self.repo.commit("F3: delete it")
+        code, out = self.repo.run_cli("main")
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            COMMIT_FINDING_RE.findall(out),
+            [("evil.txt", "private/link-local IP", merge[:12])],
+        )
+        self.assertEqual(len(FINDING_RE.findall(out)), 1)
+
+    def test_each_commit_is_read_with_the_diff_hardening(self):
+        # The runner's color, textconv and root-commit settings, and a CR-only
+        # file, cannot hide a commit's lines any more than the net diff's.
+        for key, value in [
+            ("color.ui", "always"),
+            ("diff.conv.textconv", "true"),
+            ("log.showRoot", "false"),
+        ]:
+            git_out(self.repo.path, "config", key, value)
+        self.repo.write(".gitattributes", b"*.cfg diff=conv\n")
+        self.repo.write("a.cfg", f"host {IP}\n".encode())
+        self.repo.write("m.txt", f"clean\rhost {IP}\r".encode())
+        self.repo.commit("add")
+        added = self.repo.head()
+        self.repo.write("a.cfg", b"clean\n")
+        self.repo.write("m.txt", b"clean\n")
+        self.repo.commit("clean up")
+        code, out = self.repo.run_cli("HEAD~2")
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            sorted(COMMIT_FINDING_RE.findall(out)),
+            [
+                ("a.cfg", "private/link-local IP", added[:12]),
+                ("m.txt", "private/link-local IP", added[:12]),
+            ],
+        )
 
 
 class ActionDefinitionTests(unittest.TestCase):

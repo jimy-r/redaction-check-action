@@ -79,10 +79,14 @@ jobs:
           fi
           echo "Self-test OK (positive case): the action flagged the injected fixture."
 
-      - name: Replace the fixture with clean content only
+      - name: Replace the fixture commit with clean content only
         shell: bash
         run: |
           set -euo pipefail
+          # Drop the dirty commit, not just its line. Every commit in the range
+          # is scanned, so a later commit that cleans the file still fails.
+          git reset -q --hard HEAD~1
+          mkdir -p .fixture
           printf 'This line is clean.\nSo is this one.\n' > .fixture/probe.txt
           git add .fixture/probe.txt
           git commit -q -m "self-test fixture: clean content only"
