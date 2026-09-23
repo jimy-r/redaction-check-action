@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import re
 import subprocess
 import sys
@@ -887,6 +888,24 @@ class CLITests(unittest.TestCase):
             code, out, _err = run_main(["--mode", "all-files", "--root", tmp])
         self.assertEqual(code, 1)
         self.assertIn("private/link-local IP", out)
+
+    def test_a_path_the_output_encoding_lacks_does_not_crash_the_report(self):
+        # Paths now print as they are, not git-quoted, and a Windows runner's
+        # stdout is cp1252, which has no CJK characters.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = ScratchRepo(tmp)
+            repo.write("日本/notes.md", ("host " + "10.20.30.40" + "\n").encode())
+            repo.commit("add")
+            result = subprocess.run(
+                [sys.executable, str(THIS_DIR / "redaction_check.py")]
+                + ["--base", "HEAD~1", "--root", tmp],
+                capture_output=True,
+                check=False,
+                env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+            )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(b"private/link-local IP", result.stdout)
+        self.assertNotIn(b"Traceback", result.stderr)
 
 
 class GitOutputEncodingTests(unittest.TestCase):

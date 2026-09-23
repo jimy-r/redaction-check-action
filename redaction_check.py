@@ -773,6 +773,13 @@ def report(findings: list[Finding], fail_on: str) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # A finding's path can hold any character, and a Windows runner's stdout
+    # is cp1252. Escape what the stream cannot encode instead of crashing
+    # halfway through the report.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(errors="backslashreplace")
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
