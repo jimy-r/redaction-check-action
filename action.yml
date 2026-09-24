@@ -69,15 +69,20 @@ outputs:
 runs:
   using: composite
   steps:
+    # update-environment false: the default puts this Python first on the
+    # job's PATH, and every later step in the caller's job ran on 3.12.
     - name: Set up Python
+      id: py
       uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
       with:
         python-version: '3.12'
+        update-environment: false
 
     - name: Scan for private-content shapes
       id: scan
       shell: bash
       env:
+        PYTHON: ${{ steps.py.outputs.python-path }}
         PATTERNS_FILE: ${{ inputs.patterns-file }}
         FAIL_ON: ${{ inputs.fail-on }}
         SCAN_MODE: ${{ inputs.scan-mode }}
@@ -91,8 +96,14 @@ runs:
         # the exit-code output is set however the step ends.
         report=$(mktemp "${RUNNER_TEMP:-/tmp}/redaction-check.XXXXXX")
         trap 'status=$?; if [ -n "${GITHUB_OUTPUT:-}" ]; then printf "exit-code=%s\nreport=%s\n" "$status" "$report" >> "$GITHUB_OUTPUT"; fi' EXIT
+        # The Python the setup step installed, by path. Bare `python` would be
+        # whatever the caller's job has, since that step leaves PATH alone.
+        if [ -z "${PYTHON:-}" ]; then
+          echo "::error::The Set up Python step gave no python-path, so the scan cannot run."
+          exit 2
+        fi
         scan() {
-          python "${{ github.action_path }}/redaction_check.py" "$@" | tee -a "$report"
+          "$PYTHON" "${{ github.action_path }}/redaction_check.py" "$@" | tee -a "$report"
         }
         args=(--fail-on "$FAIL_ON")
         if [ -n "$PATTERNS_FILE" ]; then

@@ -42,6 +42,20 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The action installs 3.12 for itself. A caller's own Python, here 3.13,
+      # must still be the one its later steps get.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Record the caller's Python
+        id: caller-python
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "python=$(python -c 'import sys; print(sys.version.split()[0], sys.executable)')" >> "$GITHUB_OUTPUT"
+          echo "location=${pythonLocation:-}" >> "$GITHUB_OUTPUT"
+
       # On a pull_request the checkout is GitHub's test merge, and only there
       # does the action diff against the merge's first parent. The fixture
       # steps below scan a commit on top of it, which takes the merge-base
@@ -165,3 +179,17 @@ jobs:
             exit 1
           fi
           echo "Self-test OK (negative case): clean content passed."
+
+      - name: Assert the action left the caller's Python alone
+        shell: bash
+        env:
+          BEFORE: ${{ steps.caller-python.outputs.python }}
+          BEFORE_LOCATION: ${{ steps.caller-python.outputs.location }}
+        run: |
+          set -euo pipefail
+          after=$(python -c 'import sys; print(sys.version.split()[0], sys.executable)')
+          if [ "$after" != "$BEFORE" ] || [ "${pythonLocation:-}" != "$BEFORE_LOCATION" ]; then
+            echo "::error::Self-test failed: the caller's Python was '$BEFORE' before the action ran and '$after' after it."
+            exit 1
+          fi
+          echo "Self-test OK: the caller's Python is still $after."

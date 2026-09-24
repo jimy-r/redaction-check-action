@@ -1889,6 +1889,21 @@ class ActionDefinitionTests(unittest.TestCase):
         )
         self.assertTrue(any("--pr-head" in ln for ln in self.code))
 
+    def test_the_action_leaves_the_caller_s_python_alone(self):
+        # setup-python's default update-environment: true put 3.12 first on
+        # the job's PATH, so every later step in the caller's job ran on it.
+        text = (THIS_DIR / "action.yml").read_text(encoding="utf-8")
+        setup = text[text.index("- name: Set up Python") : text.index("- name: Scan")]
+        self.assertIn("id: py", setup)
+        self.assertIn("update-environment: false", setup)
+        self.assertIn("PYTHON: ${{ steps.py.outputs.python-path }}", text)
+        step = run_block(THIS_DIR / "action.yml", "Scan for private-content shapes")
+        commands = [ln for ln in step.splitlines() if not ln.lstrip().startswith("#")]
+        self.assertEqual(
+            [ln for ln in commands if re.search(r"(?<![-\w])python(?![-\w])", ln)], []
+        )
+        self.assertTrue(any('"$PYTHON" "' in ln for ln in commands))
+
 
 class BaseRefGuardTests(unittest.TestCase):
     def test_a_base_git_could_read_as_an_option_never_reaches_git(self):
@@ -1961,14 +1976,6 @@ class ActionStepTests(unittest.TestCase):
         cls._tmp = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls._tmp.cleanup)
         cls.tmp = Path(cls._tmp.name).resolve()
-        # `python` in the step is this interpreter, whatever PATH holds.
-        shim = cls.tmp / "bin"
-        shim.mkdir()
-        python = Path(sys.executable).as_posix()
-        (shim / "python").write_text(
-            f'#!/bin/sh\nexec "{python}" "$@"\n', encoding="utf-8", newline="\n"
-        )
-        (shim / "python").chmod(0o755)
         cls.script = cls.tmp / "step.sh"
         step = run_block(THIS_DIR / "action.yml", "Scan for private-content shapes")
         cls.script.write_text(step, encoding="utf-8", newline="\n")
@@ -1992,7 +1999,8 @@ class ActionStepTests(unittest.TestCase):
             self.script,
             cwd,
             {
-                "PATH": str(self.tmp / "bin") + os.pathsep + os.environ["PATH"],
+                # What the Set up Python step's python-path output gives it.
+                "PYTHON": Path(sys.executable).as_posix(),
                 "FAIL_ON": "match",
                 "SCAN_MODE": "added-lines",
                 "PATTERNS_FILE": "",
@@ -2036,6 +2044,11 @@ class ActionStepTests(unittest.TestCase):
         )
         code, out, outputs = self.run_step(runner, BASE_REF="")
         self.assertEqual((code, outputs["exit-code"]), (2, "2"), out)
+
+    def test_no_python_path_is_a_scan_that_cannot_run(self):
+        code, out, outputs = self.run_step(self.clone(), BASE_REF=self.base, PYTHON="")
+        self.assertEqual((code, outputs["exit-code"]), (2, "2"), out)
+        self.assertIn("::error::The Set up Python step gave no python-path", out)
 
 
 @unittest.skipUnless(BASH, "needs bash, as a runner has")
@@ -2084,6 +2097,28 @@ class CISelfTestTests(unittest.TestCase):
         step = "Assert the clean fixture passed"
         self.assertEqual(self.check(step, "", EXIT_CODE="0"), 0)
         self.assertNotEqual(self.check(step, "", EXIT_CODE="2"), 0)
+
+    @unittest.skipUnless(shutil.which("python"), "the blocks call `python`")
+    def test_the_caller_s_python_must_survive_the_action(self):
+        text = self.CI.read_text(encoding="utf-8")
+        pin = text.index("python-version: '3.13'")
+        self.assertLess(pin, text.index("uses: ./"))  # pinned before any run
+        with tempfile.TemporaryDirectory() as tmp:
+            record = Path(tmp) / "record.sh"
+            block = run_block(self.CI, "Record the caller's Python")
+            record.write_text(block, encoding="utf-8", newline="\n")
+            outputs = Path(tmp) / "outputs"
+            outputs.touch()
+            env = {"GITHUB_OUTPUT": outputs.as_posix()}
+            self.assertEqual(run_bash(record, Path(tmp), env)[0], 0)
+            lines = outputs.read_text(encoding="utf-8").splitlines()
+            before = dict(ln.split("=", 1) for ln in lines)
+        step = "Assert the action left the caller's Python alone"
+        same = {"BEFORE": before["python"], "BEFORE_LOCATION": before["location"]}
+        self.assertEqual(self.check(step, "", **same), 0)
+        # What the action's own setup-python step used to leave behind.
+        moved = {**same, "BEFORE": "3.12.0 /opt/hostedtoolcache/Python/3.12.0"}
+        self.assertNotEqual(self.check(step, "", **moved), 0)
 
     def test_pull_requests_scan_the_untouched_test_merge(self):
         # The fixture commits sit on top of the test merge, so without this
