@@ -2633,6 +2633,39 @@ class ActionStepTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn(f"at {before[:12]}: 2 entries, 2 match(es) suppressed.", out)
 
+    def test_a_shallow_single_branch_checkout_still_reads_the_default_branch(self):
+        # Two commits deep with no refspec for main, so origin/main exists
+        # only if the step fetches it into place itself.
+        upstream = Path(tempfile.mkdtemp(dir=self.tmp))
+        git_out(upstream, "init", "-q", "--bare")
+        runner, before = self.branch_pushes()
+        git_out(runner, "push", "-q", upstream.as_uri(), "main", "feature")
+        shallow = Path(tempfile.mkdtemp(dir=self.tmp))
+        git_out(
+            self.tmp,
+            "clone",
+            "-q",
+            "--depth=2",
+            "--single-branch",
+            "--branch=feature",
+            upstream.as_uri(),
+            str(shallow),
+        )
+        self.assertNotIn("origin/main", git_out(shallow, "branch", "-r"))
+        code, out, _outputs = self.run_step(
+            shallow,
+            BASE_REF=before,
+            ALLOW_FILE=ALLOW,
+            EVENT_NAME="push",
+            GIT_REF="refs/heads/feature",
+            DEFAULT_BRANCH="main",
+        )
+        self.assertEqual(code, 1, out)
+        self.assertEqual(
+            FINDING_RE.findall(out), [("more.txt", "private/link-local IP")]
+        )
+        self.assertIn("(origin/main): 1 entry, 1 match(es) suppressed.", out)
+
     def test_a_default_branch_it_cannot_read_means_no_allow_file(self):
         # Never before in its place, which vouches for both addresses.
         runner, before = self.branch_pushes()

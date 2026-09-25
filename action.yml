@@ -184,10 +184,12 @@ runs:
           # is that branch's previous tip, which the pusher wrote, so an entry
           # added in one push would count from the next without review. The
           # allow file comes from the default branch's tip instead, fetched
-          # here in case the checkout is shallow. If it still names no commit,
-          # the scanner reads no allow file and says so.
+          # here in case the checkout is shallow, into origin/<name> by full
+          # refspec, since a single-branch clone maps no other branch there.
+          # If it still names no commit, the scanner reads no allow file and
+          # says so.
           if [ -n "$ALLOW_FILE" ] && [ "$EVENT_NAME" = "push" ] && [ "$GIT_REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
-            if [ -z "$DEFAULT_BRANCH" ] || ! git fetch --no-tags origin -- "$DEFAULT_BRANCH"; then
+            if [ -z "$DEFAULT_BRANCH" ] || ! git fetch --no-tags origin -- "+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"; then
               echo "::warning::Could not fetch the default branch, which the allow file is read from on this push."
             fi
             args+=("--allow-ref=origin/$DEFAULT_BRANCH")
