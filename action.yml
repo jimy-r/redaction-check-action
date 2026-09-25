@@ -186,13 +186,16 @@ runs:
           # allow file comes from the default branch's tip instead, fetched
           # here in case the checkout is shallow, into origin/<name> by full
           # refspec, since a single-branch clone maps no other branch there.
+          # It is passed by its full name too. git reads a short origin/<name>
+          # as a tag or a local branch of that name first, and a push to a
+          # branch called origin/main makes one, whose own list would count.
           # If it still names no commit, the scanner reads no allow file and
           # says so.
           if [ -n "$ALLOW_FILE" ] && [ "$EVENT_NAME" = "push" ] && [ "$GIT_REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
             if [ -z "$DEFAULT_BRANCH" ] || ! git fetch --no-tags origin -- "+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"; then
               echo "::warning::Could not fetch the default branch, which the allow file is read from on this push."
             fi
-            args+=("--allow-ref=origin/$DEFAULT_BRANCH")
+            args+=("--allow-ref=refs/remotes/origin/$DEFAULT_BRANCH")
           fi
           # On a pull_request event the checkout is GitHub's test-merge commit.
           # Given the head SHA, the scanner diffs that commit against its own

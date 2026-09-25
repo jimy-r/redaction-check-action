@@ -2385,9 +2385,10 @@ class ActionDefinitionTests(unittest.TestCase):
             "DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
         ]:
             self.assertIn(mapping, text)
-        self.assertTrue(
-            any('"--allow-ref=origin/$DEFAULT_BRANCH"' in ln for ln in self.code)
-        )
+        # By its full name: a tag or a local branch called origin/main would
+        # win over a short one.
+        allow_ref = '"--allow-ref=refs/remotes/origin/$DEFAULT_BRANCH"'
+        self.assertTrue(any(allow_ref in ln for ln in self.code))
 
     def test_the_pull_request_head_reaches_the_scanner(self):
         self.assertTrue(
@@ -2503,13 +2504,13 @@ class ActionStepTests(unittest.TestCase):
         git_out(self.tmp, "clone", "-q", url or self.url, str(runner))
         return runner
 
-    def branch_pushes(self) -> tuple[Path, str]:
+    def branch_pushes(self, branch: str = "feature") -> tuple[Path, str]:
         """Clone the vouched upstream and add two pushes to a branch: the
         first vouches for OTHER_IP on the branch alone, the second uses both
         addresses. Returns the clone and the first push's commit."""
         runner = self.clone(self.vouched_url)
         identity = ["-c", "user.email=test@example.com", "-c", "user.name=test"]
-        git_out(runner, "checkout", "-q", "-b", "feature")
+        git_out(runner, "checkout", "-q", "-b", branch)
         both = f"{IP}{FIXTURE_OK}\n{OTHER_IP}{FIXTURE_OK}\n"
         (runner / ALLOW).write_text(both, encoding="utf-8")
         git_out(runner, "add", ALLOW)
@@ -2625,13 +2626,40 @@ class ActionStepTests(unittest.TestCase):
             FINDING_RE.findall(out), [("more.txt", "private/link-local IP")]
         )
         self.assertIn("::error file=more.txt,line=2::", out)
-        self.assertIn("(origin/main): 1 entry, 1 match(es) suppressed.", out)
+        main = "(refs/remotes/origin/main): 1 entry, 1 match(es) suppressed."
+        self.assertIn(main, out)
         # To main itself, before is main's own history.
         code, out, _outputs = self.run_step(
             runner, GIT_REF="refs/heads/main", DEFAULT_BRANCH="main", **push
         )
         self.assertEqual(code, 0, out)
         self.assertIn(f"at {before[:12]}: 2 entries, 2 match(es) suppressed.", out)
+
+    def test_a_ref_named_origin_main_never_gives_the_push_its_own_list(self):
+        # A push to a branch named origin/main gets a local branch of that
+        # name from actions/checkout, and fetch-depth: 0 brings a tag of that
+        # name. The step read the list from origin/main, which git took for
+        # either one, the pushed head, whose own entries then counted.
+        for kind, branch in [("branch", "origin/main"), ("tag", "feature")]:
+            with self.subTest(kind=kind):
+                runner, before = self.branch_pushes(branch)
+                if kind == "tag":
+                    git_out(runner, "tag", "origin/main", "HEAD")
+                code, out, _outputs = self.run_step(
+                    runner,
+                    BASE_REF=before,
+                    ALLOW_FILE=ALLOW,
+                    EVENT_NAME="push",
+                    GIT_REF=f"refs/heads/{branch}",
+                    DEFAULT_BRANCH="main",
+                )
+                self.assertEqual(code, 1, out)
+                self.assertEqual(
+                    FINDING_RE.findall(out), [("more.txt", "private/link-local IP")]
+                )
+                self.assertIn("::error file=more.txt,line=2::", out)
+                main = "(refs/remotes/origin/main): 1 entry, 1 match(es) suppressed."
+                self.assertIn(main, out)
 
     def test_a_shallow_single_branch_checkout_still_reads_the_default_branch(self):
         # Two commits deep with no refspec for main, so origin/main exists
@@ -2664,7 +2692,8 @@ class ActionStepTests(unittest.TestCase):
         self.assertEqual(
             FINDING_RE.findall(out), [("more.txt", "private/link-local IP")]
         )
-        self.assertIn("(origin/main): 1 entry, 1 match(es) suppressed.", out)
+        main = "(refs/remotes/origin/main): 1 entry, 1 match(es) suppressed."
+        self.assertIn(main, out)
 
     def test_a_default_branch_it_cannot_read_means_no_allow_file(self):
         # Never before in its place, which vouches for both addresses.
