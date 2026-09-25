@@ -129,23 +129,31 @@ runs:
               exit 2
               ;;
           esac
+          # A full commit SHA (github.event.before on a push) is the base as
+          # it stands. Anything else names a branch on origin, fetched and
+          # read by its full name. git reads a short name such as origin/main
+          # as a tag or a local branch of that name first, and a push to a
+          # branch called origin/main leaves such a local branch in the
+          # checkout. A fetch of the short name main takes origin's tag main,
+          # if it has one, and leaves origin/main where it was.
+          if [[ "$BASE_REF" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+            base="$BASE_REF"
+            refspec="$BASE_REF"
+          else
+            base="refs/remotes/origin/$BASE_REF"
+            refspec="+refs/heads/$BASE_REF:$base"
+          fi
           # Full-depth fetch only. A shallow fetch into the checkout's full
           # clone marks the fetched tip as a history boundary. Once the base
           # has moved past the pull request's merge commit, that tip shares no
           # visible history with HEAD and there is no merge base to diff from.
-          # A failed fetch still leaves the checkout's own origin/<base-ref>,
+          # A failed fetch still leaves the checkout's own copy of the base,
           # and the scanner fails loudly if that is missing too.
-          if ! git fetch --no-tags origin -- "$BASE_REF"; then
+          if ! git fetch --no-tags origin -- "$refspec"; then
             # Escaped as @actions/core escapes a message, so the value cannot
             # end this line and start a workflow command of its own.
             ref=${BASE_REF//%/%25}; ref=${ref//$'\r'/%0D}; ref=${ref//$'\n'/%0A}
             echo "::warning::Could not fetch $ref from origin. Diffing against the checkout's own copy of it."
-          fi
-          # A full commit SHA (github.event.before on a push) is the base as
-          # it stands. Anything else names a branch on origin.
-          base="origin/$BASE_REF"
-          if [[ "$BASE_REF" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
-            base="$BASE_REF"
           fi
           # On a pull_request event the checkout is GitHub's test-merge commit.
           # Given the head SHA, the scanner diffs that commit against its own
