@@ -1939,6 +1939,14 @@ class AllowFileParsingTests(unittest.TestCase):
         data = f"{MODULE}\r\n".encode("utf-16")
         self.assertEqual(self.parse(rc.allow_text(data)), ({MODULE}, []))
 
+    def test_an_entry_holding_a_byte_that_is_not_text_is_ignored(self):
+        # Every such byte decodes to U+FFFD, in the scanned lines too, so the
+        # entry would cover values with any other such byte in its place.
+        entries, warnings = self.parse(rc.allow_text(b"tok=ab\xff\n" + b"a.io\n"))
+        self.assertEqual(entries, {"a.io"})
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("line 1: entry ignored, it holds U+FFFD", warnings[0])
+
 
 class AllowFileMatchingTests(unittest.TestCase):
     def scan(self, allow: rc.Allowlist, line: str) -> list[tuple[str, bool]]:
@@ -1973,6 +1981,23 @@ class AllowFileMatchingTests(unittest.TestCase):
         found = rc.scan_added_lines(diff, allow=allow_list(".env", "K=value"))
         self.assertEqual(
             [(f.label, f.allowed) for f in found], [("dotenv file", False)]
+        )
+
+    def test_an_entry_with_a_byte_that_is_not_text_covers_nothing(self):
+        entries, _warnings = rc.parse_allowlist(rc.allow_text(b"tok=ab\xff\n"), "x")
+        allow = rc.Allowlist(entries, ALLOW, found=True)
+        custom = [("custom", re.compile(r"tok=\S+"))]
+        diff = one_file_diff("c.txt", rc._text(b"tok=ab\x80"))
+        found = rc.scan_added_lines(diff, custom, allow=allow)
+        self.assertEqual([f.allowed for f in found], [False])
+
+    def test_an_allowed_ip_hides_an_ip_that_overlaps_it(self):
+        # A limit the README states: a pattern never reports two matches that
+        # overlap. The second address here starts inside the first and is
+        # never found, so allowing the first lets the whole run through.
+        self.assertEqual(
+            self.scan(allow_list("10.0.0.10"), "route 10.0.0.10.0.0.2"),
+            [("private/link-local IP", True)],
         )
 
 

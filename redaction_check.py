@@ -420,6 +420,11 @@ def parse_allowlist(text: str, where: str) -> tuple[frozenset[str], list[str]]:
             reason = f"shorter than {ALLOW_MIN_CHARS} characters"
         elif re.search(r"\s", literal):
             reason = "it holds whitespace"
+        elif "\ufffd" in literal:
+            # Every byte that is not valid text decodes to U+FFFD, in the
+            # scanned lines as well, so an entry holding one would also match
+            # values with other bytes in its place.
+            reason = "it holds U+FFFD, which stands in for any byte that is not text"
         else:
             if literal not in entries:
                 if len(entries) < ALLOW_MAX_ENTRIES:
