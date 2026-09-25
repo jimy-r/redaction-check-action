@@ -20,8 +20,9 @@ inputs:
   fail-on:
     description: >-
       'match' (default) fails the step when any finding is reported. 'none'
-      always exits 0 and reports findings as warning annotations instead --
-      use this while first rolling the gate out on an existing repo.
+      reports findings as warning annotations without failing the step --
+      use this while first rolling the gate out on an existing repo. A diff
+      that cannot be computed fails the step under either setting.
     required: false
     default: match
   scan-mode:
@@ -33,45 +34,135 @@ inputs:
     default: added-lines
   base-ref:
     description: >-
-      Branch or ref to diff against in added-lines mode. Defaults to the
-      pull request's base branch (github.base_ref). Set this explicitly
-      when triggering on an event other than pull_request.
+      Branch to diff against in added-lines mode, or a full commit SHA.
+      Defaults to the pull request's base branch (github.base_ref). Set
+      this explicitly when triggering on an event other than pull_request.
+      On a push, pass github.event.before: a push to main with base-ref
+      main diffs main against itself and scans nothing. On a pull_request
+      event against that same base, the scan diffs GitHub's test-merge
+      commit against its own first parent instead, so a base branch that
+      moves while the check is queued cannot break it.
     required: false
     default: ''
+  skip-scanner-files:
+    description: >-
+      'true' skips redaction_check.py and test_redaction_check.py at the
+      repository root, whose test fixtures are secret-shaped on purpose.
+      Only this action's own repository should set it. Anywhere else,
+      files with those names are scanned like any other. Default 'false'.
+    required: false
+    default: 'false'
+
+outputs:
+  exit-code:
+    description: >-
+      The scan's exit code. 0 means clean, or findings under fail-on none.
+      1 means findings. 2 means the scan could not run, such as a base-ref
+      it cannot use or a diff it cannot compute.
+    value: ${{ steps.scan.outputs.exit-code }}
+  report:
+    description: >-
+      Path to a file on the runner that holds the scanner's output, the
+      same masked findings the log shows.
+    value: ${{ steps.scan.outputs.report }}
 
 runs:
   using: composite
   steps:
+    # update-environment false: the default puts this Python first on the
+    # job's PATH, and every later step in the caller's job ran on 3.12.
     - name: Set up Python
+      id: py
       uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
       with:
         python-version: '3.12'
+        update-environment: false
 
     - name: Scan for private-content shapes
+      id: scan
       shell: bash
       env:
+        PYTHON: ${{ steps.py.outputs.python-path }}
         PATTERNS_FILE: ${{ inputs.patterns-file }}
         FAIL_ON: ${{ inputs.fail-on }}
         SCAN_MODE: ${{ inputs.scan-mode }}
         BASE_REF: ${{ inputs.base-ref || github.base_ref }}
+        PR_BASE_REF: ${{ github.base_ref }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        SKIP_SCANNER_FILES: ${{ inputs.skip-scanner-files }}
       run: |
         set -euo pipefail
+        # The scanner's output also goes to a file, the report output, and
+        # the exit-code output is set however the step ends.
+        report=$(mktemp "${RUNNER_TEMP:-/tmp}/redaction-check.XXXXXX")
+        trap 'status=$?; if [ -n "${GITHUB_OUTPUT:-}" ]; then printf "exit-code=%s\nreport=%s\n" "$status" "$report" >> "$GITHUB_OUTPUT"; fi' EXIT
+        # The Python the setup step installed, by path. Bare `python` would be
+        # whatever the caller's job has, since that step leaves PATH alone.
+        if [ -z "${PYTHON:-}" ]; then
+          echo "::error::The Set up Python step gave no python-path, so the scan cannot run."
+          exit 2
+        fi
+        scan() {
+          "$PYTHON" "${{ github.action_path }}/redaction_check.py" "$@" | tee -a "$report"
+        }
         args=(--fail-on "$FAIL_ON")
         if [ -n "$PATTERNS_FILE" ]; then
           args+=(--patterns-file "$PATTERNS_FILE")
         fi
+        if [ "$SKIP_SCANNER_FILES" = "true" ]; then
+          args+=(--skip-scanner-files)
+        fi
 
         if [ "$SCAN_MODE" = "all-files" ]; then
-          python "${{ github.action_path }}/redaction_check.py" --mode all-files "${args[@]}"
+          scan --mode all-files "${args[@]}"
         else
           if [ -z "$BASE_REF" ]; then
             echo "::error::scan-mode is added-lines but no base ref is available. Set the base-ref input, or trigger this action on pull_request."
-            exit 1
+            exit 2
           fi
-          # A failed fetch (e.g. the ref already exists locally with
-          # fetch-depth: 0) is not fatal -- the diff below is what matters.
-          git fetch origin "$BASE_REF" --depth=1 || true
-          git diff --unified=0 "origin/$BASE_REF...HEAD" > "$RUNNER_TEMP/redaction-check.diff"
-          python "${{ github.action_path }}/redaction_check.py" --mode added-lines \
-            --diff-file "$RUNNER_TEMP/redaction-check.diff" "${args[@]}"
+          # Before any git call. git fetch reads a value that starts with "-"
+          # as an option, and --upload-pack=<command> runs that command over a
+          # file or ssh remote. A control character could end a log line.
+          case "$BASE_REF" in
+            -* | *[[:cntrl:]]*)
+              echo "::error::base-ref cannot start with '-' or hold a control character. Pass a branch name or a full commit SHA."
+              exit 2
+              ;;
+          esac
+          # A full commit SHA (github.event.before on a push) is the base as
+          # it stands. Anything else names a branch on origin, fetched and
+          # read by its full name. git reads a short name such as origin/main
+          # as a tag or a local branch of that name first, and a push to a
+          # branch called origin/main leaves such a local branch in the
+          # checkout. A fetch of the short name main takes origin's tag main,
+          # if it has one, and leaves origin/main where it was.
+          if [[ "$BASE_REF" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+            base="$BASE_REF"
+            refspec="$BASE_REF"
+          else
+            base="refs/remotes/origin/$BASE_REF"
+            refspec="+refs/heads/$BASE_REF:$base"
+          fi
+          # Full-depth fetch only. A shallow fetch into the checkout's full
+          # clone marks the fetched tip as a history boundary. Once the base
+          # has moved past the pull request's merge commit, that tip shares no
+          # visible history with HEAD and there is no merge base to diff from.
+          # A failed fetch still leaves the checkout's own copy of the base,
+          # and the scanner fails loudly if that is missing too.
+          if ! git fetch --no-tags origin -- "$refspec"; then
+            # Escaped as @actions/core escapes a message, so the value cannot
+            # end this line and start a workflow command of its own.
+            ref=${BASE_REF//%/%25}; ref=${ref//$'\r'/%0D}; ref=${ref//$'\n'/%0A}
+            echo "::warning::Could not fetch $ref from origin. Diffing against the checkout's own copy of it."
+          fi
+          # On a pull_request event the checkout is GitHub's test-merge commit.
+          # Given the head SHA, the scanner diffs that commit against its own
+          # first parent, which needs no merge base with the base branch. It
+          # also scans each commit of the pull request on its own. If a
+          # shallow checkout hides some of them, the scanner fetches their
+          # history from origin, and the scan fails if any stay out of view.
+          if [ -n "$PR_HEAD_SHA" ] && [ "$BASE_REF" = "$PR_BASE_REF" ]; then
+            args+=(--pr-head "$PR_HEAD_SHA")
+          fi
+          scan --mode added-lines --base "$base" "${args[@]}"
         fi
