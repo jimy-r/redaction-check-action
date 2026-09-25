@@ -1939,6 +1939,31 @@ class AllowFileParsingTests(unittest.TestCase):
         data = f"{MODULE}\r\n".encode("utf-16")
         self.assertEqual(self.parse(rc.allow_text(data)), ({MODULE}, []))
 
+    def test_a_utf16_be_or_utf8_bom_is_read(self):
+        for data in (
+            b"\xfe\xff" + f"{MODULE}\n".encode("utf-16-be"),
+            b"\xef\xbb\xbf" + f"{MODULE}\n".encode(),
+        ):
+            with self.subTest(bom=data[:3]):
+                self.assertEqual(self.parse(rc.allow_text(data)), ({MODULE}, []))
+
+    def test_an_entry_is_trimmed_at_both_ends(self):
+        text = f"  {MODULE}\n\t{OTHER_MODULE}\t# why\n"
+        self.assertEqual(self.parse(text), ({MODULE, OTHER_MODULE}, []))
+
+    def test_a_four_character_entry_is_kept(self):
+        self.assertEqual(self.parse("a.io\n"), ({"a.io"}, []))
+
+    def test_the_cap_counts_unique_valid_entries_only(self):
+        # Comments, blanks, ignored lines and repeats take no place on it.
+        lines = ["# c", "", "abc"] * 50 + ["value-000"] * 50
+        lines += [f"value-{i:03d}" for i in range(201)]
+        entries, warnings = self.parse("\n".join(lines))
+        self.assertEqual(len(entries), 200)
+        self.assertIn("value-199", entries)
+        self.assertNotIn("value-200", entries)
+        self.assertEqual(sum("past the first" in w for w in warnings), 1)
+
     def test_an_entry_holding_a_byte_that_is_not_text_is_ignored(self):
         # Every such byte decodes to U+FFFD, in the scanned lines too, so the
         # entry would cover values with any other such byte in its place.
@@ -2191,6 +2216,26 @@ class AllowFileModeTests(unittest.TestCase):
         )
         self.assertIn(f": none {missing}, so nothing was suppressed.", out)
 
+    def test_a_vouched_value_left_in_the_allow_file_s_history_is_reported(self):
+        # The net diff lets the value through in app.py. The commit that
+        # listed it a second time, bare, is still in history, and a match an
+        # allow file covers never stands in for one it doesn't.
+        self.repo.write(ALLOW, f"{MODULE}{MARKED}\n".encode())
+        self.repo.commit("vouch")
+        base = self.repo.head()
+        self.repo.write(ALLOW, f"{MODULE}{MARKED}\n{MODULE}\n".encode())
+        self.repo.write("app.py", f"import pkg.{MODULE}\n".encode())
+        self.repo.commit("use it, and list it again without a reason")
+        listed = self.repo.head()
+        self.repo.write(ALLOW, f"{MODULE}{MARKED}\n".encode())
+        self.repo.commit("drop the bare line")
+        code, out = self.scan("--base", base)
+        self.assertEqual(code, 1, out)
+        self.assertEqual(
+            COMMIT_FINDING_RE.findall(out),
+            [(ALLOW, "mDNS/.local hostname", listed[:12])],
+        )
+
     def vouch_for_a_real_key(self) -> None:
         self.repo.write(ALLOW, f"{AWS_KEY}\n".encode())
         self.repo.write("deploy.sh", f"KEY={AWS_KEY}\n".encode())
@@ -2261,10 +2306,24 @@ class AllowFileModeTests(unittest.TestCase):
                         FINDING_RE.findall(out), [(own, "AWS access key ID")]
                     )
 
+    def test_stdin_reads_no_allow_file_unless_one_is_named(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / ALLOW).write_text(f"{MODULE}\n", encoding="utf-8")
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                diff = one_file_diff("app.py", f"import pkg.{MODULE}")
+                code, out, _err = run_main([], stdin_text=diff)
+            finally:
+                os.chdir(cwd)
+        self.assertEqual(code, 1)
+        self.assertNotIn("Allow file", out)
+
     def test_the_allow_options_are_refused_where_they_mean_nothing(self):
         listed = ["--allow-file", ALLOW]
         base = ["--base", "main", *listed]
         for argv in [
+            ["--allow-file", "a\n::stop-commands::x"],
             [*listed, "--allow-ref", "main"],
             ["--base", "main", "--allow-ref", "main"],
             ["--mode", "all-files", *base, "--allow-ref", "main"],
