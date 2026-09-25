@@ -2389,6 +2389,38 @@ class AllowFileModeTests(unittest.TestCase):
         )
         self.assertIn(f": none {missing}, so nothing was suppressed.", out)
 
+    def test_an_allow_ref_git_could_read_two_ways_fails_the_scan(self):
+        # git reads a short origin/main as a tag or a local branch of that
+        # name before the remote-tracking branch. The scan refuses the name
+        # rather than read whichever list git took, or read none.
+        self.repo.write(ALLOW, b"# main vouches for nothing\n")
+        self.repo.commit("main's list")
+        main = self.repo.head()
+        git_out(self.repo.path, "update-ref", "refs/remotes/origin/main", main)
+        git_out(self.repo.path, "checkout", "-q", "-b", "feature")
+        self.repo.write(ALLOW, f"{MODULE}{MARKED}\n".encode())
+        self.repo.commit("push 1 vouches on the branch")
+        before = self.repo.head()
+        self.repo.write("app.py", f"import pkg.{MODULE}\n".encode())
+        self.repo.commit("push 2 uses it")
+        for kind, delete in [("tag", "-d"), ("branch", "-D")]:
+            with self.subTest(kind=kind):
+                git_out(self.repo.path, kind, "origin/main", "HEAD")
+                code, out = self.scan("--base", before, "--allow-ref", "origin/main")
+                self.assertEqual(code, 2, out)
+                self.assertIn(
+                    "::error::Redaction gate cannot tell which allow file to "
+                    "read. origin/main is ambiguous here.",
+                    out,
+                )
+                self.assertNotIn("::notice::", out)
+                self.assertNotIn("Allow file", out)
+                full = "refs/remotes/origin/main"
+                code, out = self.scan("--base", before, "--allow-ref", full)
+                self.assertEqual(code, 1, out)
+                self.assertIn(f"at {main[:12]} ({full}): 0 entries, 0 ", out)
+                git_out(self.repo.path, kind, delete, "origin/main")
+
     def test_a_vouched_value_left_in_the_allow_file_s_history_is_reported(self):
         # The net diff lets the value through in app.py. The commit that
         # listed it a second time, bare, is still in history, and a match an
@@ -2930,6 +2962,116 @@ class ActionStepTests(unittest.TestCase):
                 self.assertIn("::error file=more.txt,line=2::", out)
                 main = "(refs/remotes/origin/main): 1 entry, 1 match(es) suppressed."
                 self.assertIn(main, out)
+
+    def test_a_ref_named_origin_main_leaves_a_push_diffed_against_main(self):
+        # The README's base-ref for a push to a branch other than main. git
+        # read the base origin/main as the pushed head, so the range was
+        # HEAD..HEAD and the whole push went unscanned.
+        for kind, branch in [("branch", "origin/main"), ("tag", "feature")]:
+            with self.subTest(kind=kind):
+                runner, _before = self.branch_pushes(branch)
+                if kind == "tag":
+                    git_out(runner, "tag", "origin/main", "HEAD")
+                code, out, _outputs = self.run_step(
+                    runner,
+                    BASE_REF="main",
+                    ALLOW_FILE=ALLOW,
+                    EVENT_NAME="push",
+                    GIT_REF=f"refs/heads/{branch}",
+                    DEFAULT_BRANCH="main",
+                )
+                self.assertEqual(code, 1, out)
+                self.assertEqual(
+                    FINDING_RE.findall(out), [("more.txt", "private/link-local IP")]
+                )
+                self.assertIn("::error file=more.txt,line=2::", out)
+                main = "(refs/remotes/origin/main): 1 entry, 1 match(es) suppressed."
+                self.assertIn(main, out)
+
+    def upstream_with_an_empty_list(self) -> tuple[ScratchRepo, str]:
+        """An upstream whose main has an allow file that vouches for nothing.
+        Returns it and main's tip."""
+        up = ScratchRepo(tempfile.mkdtemp(dir=self.tmp))
+        up.write(ALLOW, b"# nothing vouched for on main\n")
+        up.commit("main: an empty list")
+        return up, up.head()
+
+    def tag_origin_main_vouching_for_ip(self, up: ScratchRepo, at: str) -> None:
+        """Tag a child of at, on no branch, whose allow file vouches for IP."""
+        git_out(up.path, "checkout", "-q", "--detach", at)
+        up.write(ALLOW, f"{IP}{FIXTURE_OK}\n".encode())
+        up.commit("vouch, on a tag only")
+        git_out(up.path, "tag", "origin/main", up.head())
+        git_out(up.path, "checkout", "-q", "main")
+
+    def feature_using_ip(self, up: ScratchRepo, at: str) -> str:
+        """Fork feature from at and use IP there. Returns its head."""
+        git_out(up.path, "checkout", "-q", "-b", "feature", at)
+        up.write("more.txt", f"host {IP}\n".encode())
+        up.commit("use it")
+        head = up.head()
+        git_out(up.path, "checkout", "-q", "main")
+        return head
+
+    def test_a_tag_named_origin_main_never_gives_a_head_checkout_its_list(self):
+        # pull_request_target, or pull_request with ref: head.sha. The list
+        # comes from the base as it is now, which git took to be the tag.
+        up, main_tip = self.upstream_with_an_empty_list()
+        self.tag_origin_main_vouching_for_ip(up, main_tip)
+        head = self.feature_using_ip(up, main_tip)
+        url = up.path.as_uri()
+        runner = checkout_like_actions(self.tmp, url, branch="feature")
+        code, out, _outputs = self.run_step(
+            runner,
+            BASE_REF="main",
+            PR_BASE_REF="main",
+            PR_HEAD_SHA=head,
+            ALLOW_FILE=ALLOW,
+            EVENT_NAME="pull_request_target",
+            GIT_REF="refs/heads/main",
+            DEFAULT_BRANCH="main",
+        )
+        self.assertEqual(code, 1, out)
+        self.assertEqual(
+            FINDING_RE.findall(out), [("more.txt", "private/link-local IP")]
+        )
+        self.assertIn(
+            f"at {main_tip[:12]} (refs/remotes/origin/main): 0 entries, 0 ", out
+        )
+
+    def test_a_tag_named_origin_main_off_an_older_main_never_gives_its_list(self):
+        # The default pull_request checkout. The tag doesn't hold main's tip,
+        # so the scan took it for a rewritten base, widened, and read the
+        # list from the tag.
+        up, old = self.upstream_with_an_empty_list()
+        up.write("later.txt", b"later\n")
+        up.commit("main moves on")
+        main_tip = up.head()
+        self.tag_origin_main_vouching_for_ip(up, old)
+        head = self.feature_using_ip(up, main_tip)
+        git_out(up.path, "checkout", "-q", "--detach", main_tip)
+        git_out(up.path, "merge", "-q", "--no-ff", "-m", "test merge", head)
+        merge = up.head()
+        git_out(up.path, "update-ref", "refs/pull/1/merge", merge)
+        git_out(up.path, "checkout", "-q", "main")
+        runner = checkout_like_actions(self.tmp, up.path.as_uri(), merge=merge)
+        code, out, _outputs = self.run_step(
+            runner,
+            BASE_REF="main",
+            PR_BASE_REF="main",
+            PR_HEAD_SHA=head,
+            ALLOW_FILE=ALLOW,
+            EVENT_NAME="pull_request",
+            GIT_REF="refs/pull/1/merge",
+            DEFAULT_BRANCH="main",
+        )
+        self.assertEqual(code, 1, out)
+        self.assertEqual(
+            FINDING_RE.findall(out), [("more.txt", "private/link-local IP")]
+        )
+        self.assertIn("test-merge commit against its first parent", out)
+        built_on = f"at {main_tip[:12]} (the commit the test merge was built on)"
+        self.assertIn(f"{built_on}: 0 entries, 0 ", out)
 
     def test_a_shallow_single_branch_checkout_still_reads_the_default_branch(self):
         # Two commits deep with no refspec for main, so origin/main exists

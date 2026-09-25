@@ -30,7 +30,7 @@ Usage:
     python redaction_check.py --base origin/main
     python redaction_check.py --base origin/main --pr-head <sha>  # PR merge ref
     python redaction_check.py --base origin/main --allow-file .redaction-allow
-    python redaction_check.py --base <sha> --allow-file .redaction-allow --allow-ref origin/main
+    python redaction_check.py --base <sha> --allow-file .redaction-allow --allow-ref refs/remotes/origin/main
     python redaction_check.py --mode all-files --root .
     python redaction_check.py --selftest
 """
@@ -488,6 +488,8 @@ def allow_source(
     an entry would still find the entry there. allow_ref, when given, is read
     in place of the base. The action passes the default branch that way on a
     push to any other branch, whose base is the pusher's own previous push.
+    Raises DiffError when git could read the ref as more than one ref (see
+    resolve_ref), since the list would then come from whichever git took.
     """
     ref = allow_ref or base
     if not allow_ref and pr_head:
@@ -496,10 +498,9 @@ def allow_source(
                 from_commit,
                 f"at {from_commit[:12]} (the commit the test merge was built on)",
             )
-    resolved = _git(root, "rev-parse", "--verify", f"{ref}^{{commit}}")
-    if resolved.returncode != 0:
+    sha = resolve_ref(ref, root)
+    if sha is None:
         return None, f"from {ref}, which names no commit in this clone"
-    sha = _text(resolved.stdout).strip()
     if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", ref, re.IGNORECASE):
         return sha, f"at {sha[:12]}"
     return sha, f"at {sha[:12]} ({ref})"
@@ -1470,7 +1471,9 @@ def main(argv: list[str] | None = None) -> int:
         metavar="REF",
         help="with --base and --allow-file: read the allow file from REF instead "
         "of the base. The action passes the default branch on a push to any "
-        "other branch. If REF names no commit here, no allow file is read",
+        "other branch, as refs/remotes/origin/<name>. If REF names no commit "
+        "here, no allow file is read. If it could be more than one ref, such "
+        "as origin/main beside a tag of that name, the scan exits 2",
     )
     ap.add_argument(
         "--allow-path",
@@ -1567,14 +1570,20 @@ def main(argv: list[str] | None = None) -> int:
                     args.base, args.root, args.pr_head
                 )
                 if args.allow_file:
-                    source, allow_where = allow_source(
-                        args.base,
-                        from_commit,
-                        to_commit,
-                        args.root,
-                        args.pr_head,
-                        args.allow_ref,
-                    )
+                    try:
+                        source, allow_where = allow_source(
+                            args.base,
+                            from_commit,
+                            to_commit,
+                            args.root,
+                            args.pr_head,
+                            args.allow_ref,
+                        )
+                    except DiffError as exc:
+                        # Never a guess at the list, and never no list: exit 2.
+                        reason = f"Redaction gate cannot tell which allow file to read. {exc}"
+                        print(f"::error::{command_data(reason)}")
+                        return 2
                     data = None
                     if source:
                         data = allow_file_at(source, args.allow_file, args.root)

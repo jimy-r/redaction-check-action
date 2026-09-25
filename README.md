@@ -95,7 +95,7 @@ jobs:
           base-ref: ${{ github.event.repository.default_branch }}
 ```
 
-On such a push the allow file always comes from the default branch's tip, whatever `base-ref` says. See [Where the list comes from](#where-the-list-comes-from).
+On such a push the allow file comes from the default branch's tip, whatever `base-ref` says, and never from the branch being pushed. See [Where the list comes from](#where-the-list-comes-from).
 
 ## Inputs
 
@@ -153,11 +153,13 @@ In `added-lines` mode the list is read from a commit outside the change under sc
 - **A push to the default branch.** The commit the push started from, `github.event.before`, which is that branch's own history.
 - **A push to any other branch.** The default branch's tip. There `github.event.before` is the branch's own previous push, which the pusher wrote, so an entry added in one push would count from the next without review.
 
+The action names both branches in full, as `refs/remotes/origin/<name>`. git reads a short `origin/<name>` as a tag or a local branch of that name first, and a push to a branch called `origin/main` leaves just such a local branch in the checkout, whose own list would then count. The script refuses a `--base` or `--allow-ref` that could be more than one ref, so the scan exits 2 rather than read a list from the wrong commit.
+
 If that commit isn't in the clone (a shallow checkout whose fetch of the default branch failed, say), the scan reads no allow file at all and a notice says so. It never falls back to the branch's own copy.
 
 In `all-files` mode there's no change under scan. The list is read as `HEAD` commits it, so an uncommitted edit doesn't count, and that committed copy is also the one scanned as the allow file itself, whatever its size.
 
-A diff on stdin or in `--diff-file`, when you run the script yourself, has no base to read from, so `--allow-file` is read from disk as given. Hand it the base's copy (`git show origin/main:.redaction-allow > base-allow.txt`), never the branch's own. The allow file's own lines in the diff are known by their path there, `.redaction-allow` unless `--allow-path` names another, whatever the copy on disk is called.
+A diff on stdin or in `--diff-file`, when you run the script yourself, has no base to read from, so `--allow-file` is read from disk as given. Hand it the base's copy (`git show refs/remotes/origin/main:.redaction-allow > base-allow.txt`), never the branch's own. The allow file's own lines in the diff are known by their path there, `.redaction-allow` unless `--allow-path` names another, whatever the copy on disk is called.
 
 The list never applies to a file with the allow file's name, whatever the mode. The allow file's own lines are scanned like any other, so a real secret pasted into it is reported like a secret pasted anywhere else. So is an ordinary entry, because an entry has a finding's shape or it wouldn't be there. That's why the example line carries `redaction-ok`. The change that adds an entry fails until the entry's own line says why the value is safe, where a reviewer reads it and `grep -rn redaction-ok` finds it later.
 
