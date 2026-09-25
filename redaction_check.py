@@ -369,6 +369,10 @@ ALLOW_MAX_ENTRIES = 200
 # A `#` that opens a line, or follows whitespace, starts a comment. An entry's
 # line can then carry a `redaction-ok` marker and the reason the value is safe.
 ALLOW_COMMENT_RE = re.compile(r"(?:^|\s)#")
+# Where the allow file sits in a repository unless a caller says otherwise. A
+# diff on stdin names its files by this kind of path, never by where a copy of
+# the allow file was saved on disk.
+DEFAULT_ALLOW_PATH = ".redaction-allow"
 
 
 @dataclass(frozen=True)
@@ -379,11 +383,13 @@ class Allowlist:
     entry, case and all. Every other match on the same line is still reported,
     and so is a value that contains an entry or sits inside one. A file with
     the allow file's name never gets the list. Its lines are scanned as if
-    there were none, so a real secret pasted into it is still reported.
+    there were none, so a real secret pasted into it is still reported. The
+    name is the one the allow file has in the repository, never the name of a
+    copy the list was read from.
     """
 
     entries: frozenset[str] = frozenset()
-    name: str = ""  # the allow file's basename
+    name: str = ""  # the allow file's basename in the repository
     found: bool = False  # False when there was no file to read
 
     def covers(self, path: str, matched: str) -> bool:
@@ -430,9 +436,16 @@ def parse_allowlist(text: str, where: str) -> tuple[frozenset[str], list[str]]:
     return frozenset(entries), warnings
 
 
-def load_allowlist(path: str, data: bytes | None, where: str) -> Allowlist:
-    """Build the list from the allow file's bytes, printing each warning."""
-    name = path.replace("\\", "/").rsplit("/", 1)[-1]
+def load_allowlist(
+    path: str, data: bytes | None, where: str, repo_path: str | None = None
+) -> Allowlist:
+    """Build the list from the allow file's bytes, printing each warning.
+
+    repo_path is the allow file's path in the repository, whose name the list
+    never applies to. It is path itself unless the list was read from a copy
+    on disk.
+    """
+    name = (repo_path or path).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
     if data is None:
         return Allowlist(name=name)
     entries, warnings = parse_allowlist(allow_text(data), f"Allow file {path} {where}")
@@ -1386,6 +1399,14 @@ def main(argv: list[str] | None = None) -> int:
         "other branch. If REF names no commit here, no allow file is read",
     )
     ap.add_argument(
+        "--allow-path",
+        metavar="PATH",
+        help="with --allow-file and a diff on stdin or --diff-file: the allow "
+        f"file's path in the repository (default {DEFAULT_ALLOW_PATH}). The list "
+        "never applies to a file with that name in the diff, whatever the copy "
+        "on disk is called",
+    )
+    ap.add_argument(
         "--summary-file",
         metavar="PATH",
         help="append a Markdown summary of the counts to this file "
@@ -1432,6 +1453,14 @@ def main(argv: list[str] | None = None) -> int:
         or any(ord(ch) < 32 or ord(ch) == 127 for ch in args.allow_ref)
     ):
         ap.error("--allow-ref cannot start with '-' or hold a control character")
+    if args.allow_path and (
+        args.base or args.mode == "all-files" or not args.allow_file
+    ):
+        ap.error(
+            "--allow-path goes with --allow-file and a diff on stdin or in "
+            "--diff-file. With --base or in all-files mode, --allow-file is "
+            "already the path in the repository"
+        )
 
     if args.selftest:
         return run_selftest()
@@ -1512,9 +1541,13 @@ def main(argv: list[str] | None = None) -> int:
             diff_text = _text(stdin_bytes.read()) if stdin_bytes else sys.stdin.read()
         if args.allow_file and not args.base:
             # No base to read it from. The caller hands over the base's copy.
+            # The diff names the allow file by its path in the repository,
+            # whatever that copy is called, so that path is what the list
+            # never applies to.
             allow_where = "on disk"
             data = allow_file_on_disk(args.allow_file)
-            allow = load_allowlist(args.allow_file, data, allow_where)
+            repo_path = args.allow_path or DEFAULT_ALLOW_PATH
+            allow = load_allowlist(args.allow_file, data, allow_where, repo_path)
         net = scan_added_lines(
             diff_text, extra_patterns, added_paths, skip_paths, is_media_file, allow
         )

@@ -2206,6 +2206,36 @@ class AllowFileModeTests(unittest.TestCase):
         self.assertEqual(FINDING_RE.findall(out), [(ALLOW, "AWS access key ID")])
         self.assertEqual(code, 1)
 
+    def test_stdin_knows_the_allow_file_by_its_path_in_the_diff(self):
+        # The branch's own copy handed over by mistake, under another name.
+        # Its own line is still reported, whatever the copy is called.
+        base = self.repo.head()
+        self.vouch_for_a_real_key()
+        diff = rc.get_diff_via_git(base, str(self.repo.path))
+        with tempfile.TemporaryDirectory() as tmp:
+            copy = Path(tmp) / "head-allow.txt"
+            copy.write_bytes((self.repo.path / ALLOW).read_bytes())
+            code, out, err = run_main(["--allow-file", str(copy)], stdin_text=diff)
+        self.assertEqual(FINDING_RE.findall(out), [(ALLOW, "AWS access key ID")])
+        self.assertEqual(code, 1)
+        self.assertNotIn(AWS_KEY, out + err)
+
+    def test_allow_path_names_the_allow_file_in_the_diff(self):
+        diff = one_file_diff(ALLOW, AWS_KEY) + one_file_diff("cfg/allow.txt", AWS_KEY)
+        with tempfile.TemporaryDirectory() as tmp:
+            copy = Path(tmp) / "copy.txt"
+            copy.write_text(f"{AWS_KEY}\n", encoding="utf-8")
+            for extra, own in [
+                ([], ALLOW),
+                (["--allow-path", "cfg/allow.txt"], "cfg/allow.txt"),
+            ]:
+                with self.subTest(extra=extra):
+                    argv = ["--allow-file", str(copy), *extra]
+                    code, out, _err = run_main(argv, stdin_text=diff)
+                    self.assertEqual(
+                        FINDING_RE.findall(out), [(own, "AWS access key ID")]
+                    )
+
     def test_the_allow_options_are_refused_where_they_mean_nothing(self):
         listed = ["--allow-file", ALLOW]
         base = ["--base", "main", *listed]
@@ -2215,6 +2245,9 @@ class AllowFileModeTests(unittest.TestCase):
             ["--mode", "all-files", *base, "--allow-ref", "main"],
             [*base, "--allow-ref=-x"],
             [*base, "--allow-ref", "main\n::warning::x"],
+            ["--allow-path", ALLOW],
+            [*base, "--allow-path", ALLOW],
+            ["--mode", "all-files", *listed, "--allow-path", ALLOW],
         ]:
             with self.subTest(argv=argv):
                 git = mock.patch.object(rc, "_git", side_effect=AssertionError("git"))

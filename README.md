@@ -157,7 +157,7 @@ If that commit isn't in the clone (a shallow checkout whose fetch of the default
 
 In `all-files` mode there's no change under scan. The list is read as `HEAD` commits it, so an uncommitted edit doesn't count, and that committed copy is also the one scanned as the allow file itself, whatever its size.
 
-A diff on stdin or in `--diff-file`, when you run the script yourself, has no base to read from, so `--allow-file` is read from disk as given. Hand it the base's copy (`git show origin/main:.redaction-allow > base-allow/.redaction-allow`), never the branch's own.
+A diff on stdin or in `--diff-file`, when you run the script yourself, has no base to read from, so `--allow-file` is read from disk as given. Hand it the base's copy (`git show origin/main:.redaction-allow > base-allow.txt`), never the branch's own. The allow file's own lines in the diff are known by their path there, `.redaction-allow` unless `--allow-path` names another, whatever the copy on disk is called.
 
 The list never applies to a file with the allow file's name, whatever the mode. The allow file's own lines are scanned like any other, so a real secret pasted into it is reported like a secret pasted anywhere else. So is an ordinary entry, because an entry has a finding's shape or it wouldn't be there. That's why the example line carries `redaction-ok`. The change that adds an entry fails until the entry's own line says why the value is safe, where a reviewer reads it and `grep -rn redaction-ok` finds it later.
 
