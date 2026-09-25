@@ -72,12 +72,37 @@ jobs:
 
 `base-ref` takes a full commit SHA as well as a branch name. The push that creates a branch has no earlier commit (`github.event.before` is all zeros), so that one run fails with an error rather than passing.
 
+On a push to any other branch, diff against the default branch instead. That scans everything the branch adds, the push that creates it included:
+
+```yaml
+on:
+  push:
+    branches-ignore: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  redaction:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: jimy-r/redaction-check-action@v1
+        with:
+          base-ref: ${{ github.event.repository.default_branch }}
+```
+
+On such a push the allow file always comes from the default branch's tip, whatever `base-ref` says. See [Where the list comes from](#where-the-list-comes-from).
+
 ## Inputs
 
 | Input | Default | Meaning |
 |---|---|---|
 | `patterns-file` | *(none)* | Path to an extra denylist, one regular expression per line. `#` comments and blank lines are skipped. |
-| `allow-file` | `.redaction-allow` | Path to an allow file, one exact value per line, whose matches are counted instead of reported. It's read from the base commit, so an entry counts once it has merged, and it never applies to the allow file itself. `''` turns it off. See [Allowing a known value](#allowing-a-known-value). |
+| `allow-file` | `.redaction-allow` | Path to an allow file, one exact value per line, whose matches are counted instead of reported. `added-lines` mode reads it from a commit outside the change, such as the pull request's base, so an entry counts once it has landed. `all-files` mode reads it from `HEAD`. It never applies to the allow file itself. `''` turns it off. See [Where the list comes from](#where-the-list-comes-from). |
 | `fail-on` | `match` | `match` fails the step on any finding. `none` reports findings as warnings without failing on them, useful while first rolling the gate out on an existing repo. A diff that can't be computed fails the step either way. |
 | `scan-mode` | `added-lines` | `added-lines` scans only what the PR adds. `all-files` walks every git-tracked file instead, for a full-repo audit run. |
 | `base-ref` | *(auto)* | Branch to diff against, or a full commit SHA. Defaults to the pull request's base branch. A value that starts with `-` or holds a control character fails the step before any git command runs, since git would read it as an option. Set it explicitly when triggering on an event other than `pull_request`, and on `push` see [Running on push](#running-on-push). |
@@ -119,11 +144,20 @@ Put one value on each line. Blank lines and `#` comments are skipped, and so is 
 
 The match is exact and case-sensitive. A finding is let through only when the text its pattern matched is identical to an entry. Every other pattern still scans that line, and a value that contains an entry, or sits inside one, is still reported. A secret-shaped filename is never let through this way. The log and the job summary say how many matches the allow file let through.
 
-The list is always read from a commit the change under scan doesn't control:
+### Where the list comes from
 
-- **Pull requests and pushes (`added-lines`).** The allow file as the base commit has it, which is the commit GitHub built the test merge on, or the commit a push started from. The net diff and every commit in the range get that one list. An entry a pull request adds lets nothing through in that pull request. It starts counting once it has merged.
-- **`all-files`.** The allow file as `HEAD` has it. An uncommitted edit doesn't count.
-- **A diff on stdin or in `--diff-file` (running the script yourself).** There's no base to read from, so `--allow-file` is read from disk as given. Hand it the base's copy (`git show origin/main:.redaction-allow > base-allow/.redaction-allow`), never the branch's own.
+In `added-lines` mode the list is read from a commit outside the change under scan, so an entry a pull request or push adds lets nothing through in that same change. It counts once it has landed. The net diff and every commit in the range get that one list. Which commit depends on the checkout:
+
+- **A pull request's test merge**, the default checkout on `pull_request`. The commit GitHub built the test merge on, the base branch's tip at that moment.
+- **Any other pull-request checkout, or a `base-ref` set by hand.** The base as it is now. That's the tip of the base branch, which the action fetches first, or the commit a SHA `base-ref` names. It covers `pull_request_target` and any other checkout of the pull request's head, and the script's own `--base`. It's never the merge base, where a branch that forked before the base dropped an entry would still find it.
+- **A push to the default branch.** The commit the push started from, `github.event.before`, which is that branch's own history.
+- **A push to any other branch.** The default branch's tip. There `github.event.before` is the branch's own previous push, which the pusher wrote, so an entry added in one push would count from the next without review.
+
+If that commit isn't in the clone (a shallow checkout whose fetch of the default branch failed, say), the scan reads no allow file at all and a notice says so. It never falls back to the branch's own copy.
+
+In `all-files` mode there's no change under scan. The list is read as `HEAD` commits it, so an uncommitted edit doesn't count.
+
+A diff on stdin or in `--diff-file`, when you run the script yourself, has no base to read from, so `--allow-file` is read from disk as given. Hand it the base's copy (`git show origin/main:.redaction-allow > base-allow/.redaction-allow`), never the branch's own.
 
 The list never applies to a file with the allow file's name, whatever the mode. The allow file's own lines are scanned like any other, so a real secret pasted into it is reported like a secret pasted anywhere else. So is an ordinary entry, because an entry has a finding's shape or it wouldn't be there. That's why the example line carries `redaction-ok`. The change that adds an entry fails until the entry's own line says why the value is safe, where a reviewer reads it and `grep -rn redaction-ok` finds it later.
 

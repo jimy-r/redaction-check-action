@@ -18,9 +18,10 @@ Exit 0 = clean (or findings under --fail-on none). Exit 1 = findings and
 scan could not be computed, which is never a pass, whatever --fail-on says.
 A genuine false positive: mark the specific line with a `redaction-ok`
 comment, or override on merge. A value that recurs can go in an allow file
-(--allow-file), one exact literal per line. With --base it is read as the
-range's base commit has it, so an entry the change itself adds lets nothing
-through, and it never applies to a file with its own name.
+(--allow-file), one exact literal per line. With --base it is read from the
+base as it is now, or from the commit a pull request's test merge was built
+on, never from the change or its merge base, so an entry the change itself
+adds lets nothing through. It never applies to a file with its own name.
 
 Usage:
     python redaction_check.py --diff-file changes.diff
@@ -28,6 +29,7 @@ Usage:
     python redaction_check.py --base origin/main
     python redaction_check.py --base origin/main --pr-head <sha>  # PR merge ref
     python redaction_check.py --base origin/main --allow-file .redaction-allow
+    python redaction_check.py --base <sha> --allow-file .redaction-allow --allow-ref origin/main
     python redaction_check.py --mode all-files --root .
     python redaction_check.py --selftest
 """
@@ -446,6 +448,41 @@ def allow_file_at(commit: str, path: str, root: str = ".") -> bytes | None:
     """
     result = _git(root, "cat-file", "blob", f"{commit}:{path}")
     return result.stdout if result.returncode == 0 else None
+
+
+def allow_source(
+    base: str,
+    from_commit: str,
+    to_commit: str,
+    root: str = ".",
+    pr_head: str | None = None,
+    allow_ref: str | None = None,
+) -> tuple[str | None, str]:
+    """Return the commit a --base scan reads the allow file from, and where
+    that is, in words for the log. The commit is None when the ref it should
+    come from names no commit in this clone, and then no list is read at all.
+
+    A pull request's test merge, scanned against its own first parent, reads
+    the commit that merge was built on. Any other range reads the base as it
+    is now. Never the merge base: a branch that forked before its base dropped
+    an entry would still find the entry there. allow_ref, when given, is read
+    in place of the base. The action passes the default branch that way on a
+    push to any other branch, whose base is the pusher's own previous push.
+    """
+    ref = allow_ref or base
+    if not allow_ref and pr_head:
+        if commit_parents(to_commit, root) == [from_commit, pr_head.strip().lower()]:
+            return (
+                from_commit,
+                f"at {from_commit[:12]} (the commit the test merge was built on)",
+            )
+    resolved = _git(root, "rev-parse", "--verify", f"{ref}^{{commit}}")
+    if resolved.returncode != 0:
+        return None, f"from {ref}, which names no commit in this clone"
+    sha = _text(resolved.stdout).strip()
+    if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", ref, re.IGNORECASE):
+        return sha, f"at {sha[:12]}"
+    return sha, f"at {sha[:12]} ({ref})"
 
 
 def allow_file_on_disk(path: str) -> bytes | None:
@@ -1304,10 +1341,18 @@ def main(argv: list[str] | None = None) -> int:
         "--allow-file",
         metavar="PATH",
         help="allow file: exact values, one per line, whose matches are counted "
-        "instead of reported. With --base it is a path in the repo, read as the "
-        "range's base commit has it. In all-files mode it is read as HEAD has it. "
+        "instead of reported. With --base it is a path in the repo, read from the "
+        "base as it is now, or for a pull request's test merge from the commit "
+        "the merge was built on. In all-files mode it is read as HEAD has it. "
         "With a diff on stdin or --diff-file it is read from disk as given, so "
         "pass the base's copy",
+    )
+    ap.add_argument(
+        "--allow-ref",
+        metavar="REF",
+        help="with --base and --allow-file: read the allow file from REF instead "
+        "of the base. The action passes the default branch on a push to any "
+        "other branch. If REF names no commit here, no allow file is read",
     )
     ap.add_argument(
         "--summary-file",
@@ -1343,6 +1388,19 @@ def main(argv: list[str] | None = None) -> int:
         ord(ch) < 32 or ord(ch) == 127 for ch in args.allow_file
     ):
         ap.error("--allow-file cannot hold a control character")
+    if args.allow_ref and not (
+        args.base and args.allow_file and args.mode == "added-lines"
+    ):
+        ap.error(
+            "--allow-ref needs --base and --allow-file, since it names the commit "
+            "a --base scan reads the allow file from"
+        )
+    # Printed as well, and read by git, which takes a leading "-" for an option.
+    if args.allow_ref and (
+        args.allow_ref.startswith("-")
+        or any(ord(ch) < 32 or ord(ch) == 127 for ch in args.allow_ref)
+    ):
+        ap.error("--allow-ref cannot start with '-' or hold a control character")
 
     if args.selftest:
         return run_selftest()
@@ -1370,9 +1428,26 @@ def main(argv: list[str] | None = None) -> int:
                     args.base, args.root, args.pr_head
                 )
                 if args.allow_file:
-                    allow_where = f"at {from_commit[:12]} (the scanned range's base)"
-                    data = allow_file_at(from_commit, args.allow_file, args.root)
+                    source, allow_where = allow_source(
+                        args.base,
+                        from_commit,
+                        to_commit,
+                        args.root,
+                        args.pr_head,
+                        args.allow_ref,
+                    )
+                    data = None
+                    if source:
+                        data = allow_file_at(source, args.allow_file, args.root)
                     allow = load_allowlist(args.allow_file, data, allow_where)
+                    if source is None:
+                        # Never the branch's own copy in its place: no list.
+                        notice = (
+                            f"No allow file was read, since it comes {allow_where}. "
+                            "Every match is reported. Fetch that ref first, or "
+                            "check out with fetch-depth: 0."
+                        )
+                        print(f"::notice::{command_data(notice)}")
                 diff_text = git_diff(from_commit, to_commit, args.root)
                 added_paths = git_added_paths(from_commit, to_commit, args.root)
                 is_media_file = media_at(to_commit, args.root)

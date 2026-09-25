@@ -1437,6 +1437,17 @@ class RewrittenBaseTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("file=leak.txt", out)
 
+    def test_a_rewritten_base_gives_the_allow_file_from_its_tip(self):
+        # The widened range starts at the merge base, before the rewrite, so
+        # the list comes from the base as it now stands.
+        runner = self.checkout()
+        frm, to, _how = rc.resolve_diff_range("origin/main", runner, self.pr_head)
+        tip = git_out(runner, "rev-parse", "origin/main")
+        self.assertEqual(
+            rc.allow_source("origin/main", frm, to, runner, self.pr_head),
+            (tip, f"at {tip[:12]} (origin/main)"),
+        )
+
     def test_rewritten_base_without_history_to_widen_from_is_an_error(self):
         # At depth 1 the first parent arrives by deepening, as a shallow
         # boundary, so no merge base is visible. The base's own history is
@@ -1866,8 +1877,10 @@ class CommitHistoryTests(unittest.TestCase):
 MODULE = "adapters" + ".local"
 OTHER_MODULE = "reports" + ".local"
 AWS_KEY = "AKIA" + "EXAMPLE000000000"
+OTHER_IP = "10.20.30.41"
 ALLOW = ".redaction-allow"
 MARKED = "  # redaction-ok: a module path, not a host"
+FIXTURE_OK = "  # redaction-ok: a test fixture"
 
 
 def allow_list(*entries: str) -> rc.Allowlist:
@@ -1998,7 +2011,8 @@ class AllowFileModeTests(unittest.TestCase):
         self.assertEqual(FINDING_RE.findall(out), [("app.py", "mDNS/.local hostname")])
         self.assertIn("::error file=app.py,line=2::", out)
         self.assertIn(
-            f"at {base_tip[:12]} (the scanned range's base): 1 entry, 1 ", out
+            f"at {base_tip[:12]} (the commit the test merge was built on): 1 entry, 1 ",
+            out,
         )
 
     def test_each_commit_gets_the_base_list_not_its_parent_s(self):
@@ -2068,6 +2082,106 @@ class AllowFileModeTests(unittest.TestCase):
         self.assertIn("on disk: 1 entry, 1 match(es) suppressed.", text)
         self.assertNotIn(MODULE, out + text)
 
+    def fork_then_move_main(self, at_fork: str, later: str) -> str:
+        """Give main's allow file at_fork, fork feature, which uses MODULE, then
+        give main's allow file later. Returns feature's head, checked out."""
+        self.repo.write(ALLOW, at_fork.encode())
+        self.repo.commit("main's list when feature forks")
+        git_out(self.repo.path, "checkout", "-q", "-b", "feature")
+        self.repo.write("app.py", f"import pkg.{MODULE}\n".encode())
+        self.repo.commit("use it")
+        head = self.repo.head()
+        git_out(self.repo.path, "checkout", "-q", "main")
+        self.repo.write(ALLOW, later.encode())
+        self.repo.commit("main's list moves on")
+        git_out(self.repo.path, "checkout", "-q", "feature")
+        return head
+
+    def test_a_checkout_of_the_head_reads_the_base_as_it_is_now(self):
+        # The head checked out, as with pull_request_target or ref: head.sha,
+        # and --base alone, as for a base-ref set by hand. The list used to
+        # come from the merge base, where feature forked, so an entry main
+        # had removed since still counted.
+        head = self.fork_then_move_main(f"{MODULE}{MARKED}\n", "# revoked\n")
+        main = git_out(self.repo.path, "rev-parse", "main")
+        for pr_head in (["--pr-head", head], []):
+            with self.subTest(pr_head=pr_head):
+                code, out = self.scan("--base", "main", *pr_head)
+                self.assertEqual(code, 1, out)
+                self.assertIn(f"at {main[:12]} (main): 0 entries, 0 ", out)
+
+    def test_an_entry_the_base_gains_after_the_fork_counts(self):
+        head = self.fork_then_move_main("# none yet\n", f"{MODULE}{MARKED}\n")
+        code, out = self.scan("--base", "main", "--pr-head", head)
+        self.assertEqual(code, 0, out)
+        self.assertIn("(main): 1 entry, 1 match(es) suppressed.", out)
+
+    def test_the_test_merge_reads_the_commit_it_was_built_on(self):
+        # A base that moves on while the check is queued doesn't change it.
+        head = self.fork_then_move_main("# none yet\n", f"{MODULE}{MARKED}\n")
+        built_on = git_out(self.repo.path, "rev-parse", "main~1")
+        git_out(self.repo.path, "checkout", "-q", "--detach", built_on)
+        git_out(self.repo.path, "merge", "-q", "--no-ff", "-m", "M", head)
+        code, out = self.scan("--base", "main", "--pr-head", head)
+        self.assertEqual(code, 1, out)
+        where = f"at {built_on[:12]} (the commit the test merge was built on)"
+        self.assertIn(f"{where}: 0 entries, 0 match(es) suppressed.", out)
+
+    def test_a_push_range_reads_its_base_unless_allow_ref_names_another(self):
+        # Pushed to main, before is main's own history. Pushed to another
+        # branch, before is the pusher's last push, so the action names the
+        # default branch in --allow-ref.
+        self.repo.write(ALLOW, f"{MODULE}{MARKED}\n".encode())
+        self.repo.commit("main vouches for one module path")
+        git_out(self.repo.path, "checkout", "-q", "-b", "feature")
+        self.repo.write(ALLOW, f"{MODULE}{MARKED}\n{OTHER_MODULE}{MARKED}\n".encode())
+        self.repo.commit("push 1 vouches for another")
+        before = self.repo.head()
+        self.repo.write(
+            "app.py", f"import pkg.{MODULE}\nimport pkg.{OTHER_MODULE}\n".encode()
+        )
+        self.repo.commit("push 2 uses both")
+        code, out = self.scan("--base", before)
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"at {before[:12]}: 2 entries, 2 match(es) suppressed.", out)
+        code, out = self.scan("--base", before, "--allow-ref", "main")
+        self.assertEqual(code, 1, out)
+        self.assertEqual(FINDING_RE.findall(out), [("app.py", "mDNS/.local hostname")])
+        self.assertIn("::error file=app.py,line=2::", out)
+        main = git_out(self.repo.path, "rev-parse", "main")
+        self.assertIn(f"at {main[:12]} (main): 1 entry, 1 match(es) suppressed.", out)
+
+    def test_a_ref_that_names_no_commit_means_no_list(self):
+        self.repo.write(ALLOW, f"{MODULE}{MARKED}\n".encode())
+        self.repo.commit("vouch")
+        base = self.repo.head()
+        self.repo.write("app.py", f"import pkg.{MODULE}\n".encode())
+        self.repo.commit("use it")
+        # The base and HEAD both vouch for it. Neither stands in.
+        code, out = self.scan("--base", base, "--allow-ref", "origin/main")
+        self.assertEqual(code, 1, out)
+        missing = "from origin/main, which names no commit in this clone"
+        self.assertIn(
+            f"::notice::No allow file was read, since it comes {missing}.", out
+        )
+        self.assertIn(f": none {missing}, so nothing was suppressed.", out)
+
+    def test_the_allow_options_are_refused_where_they_mean_nothing(self):
+        listed = ["--allow-file", ALLOW]
+        base = ["--base", "main", *listed]
+        for argv in [
+            [*listed, "--allow-ref", "main"],
+            ["--base", "main", "--allow-ref", "main"],
+            ["--mode", "all-files", *base, "--allow-ref", "main"],
+            [*base, "--allow-ref=-x"],
+            [*base, "--allow-ref", "main\n::warning::x"],
+        ]:
+            with self.subTest(argv=argv):
+                git = mock.patch.object(rc, "_git", side_effect=AssertionError("git"))
+                with git, self.assertRaises(SystemExit) as ctx:
+                    run_main([*argv, "--diff-file", os.devnull])
+                self.assertEqual(ctx.exception.code, 2)
+
 
 class ActionDefinitionTests(unittest.TestCase):
     """These tests never run action.yml's shell step, so guard its key lines."""
@@ -2103,6 +2217,19 @@ class ActionDefinitionTests(unittest.TestCase):
         self.assertTrue(any('"--allow-file=$ALLOW_FILE"' in ln for ln in self.code))
         self.assertTrue(
             any('"--summary-file=$GITHUB_STEP_SUMMARY"' in ln for ln in self.code)
+        )
+
+    def test_a_push_elsewhere_reads_the_allow_file_from_the_default_branch(self):
+        # ActionStepTests set these variables by hand, so guard their source.
+        text = (THIS_DIR / "action.yml").read_text(encoding="utf-8")
+        for mapping in [
+            "EVENT_NAME: ${{ github.event_name }}",
+            "GIT_REF: ${{ github.ref }}",
+            "DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
+        ]:
+            self.assertIn(mapping, text)
+        self.assertTrue(
+            any('"--allow-ref=origin/$DEFAULT_BRANCH"' in ln for ln in self.code)
         )
 
     def test_the_pull_request_head_reaches_the_scanner(self):
@@ -2207,11 +2334,36 @@ class ActionStepTests(unittest.TestCase):
         up.write("notes.txt", f"host {IP}\n".encode())
         up.commit("add a host")
         cls.url = up.path.as_uri()
+        # A second upstream whose main vouches for IP.
+        (cls.tmp / "vouched").mkdir()
+        vouched = ScratchRepo(str(cls.tmp / "vouched"))
+        vouched.write(ALLOW, f"{IP}{FIXTURE_OK}\n".encode())
+        vouched.commit("main vouches for one address")
+        cls.vouched_url = vouched.path.as_uri()
 
-    def clone(self) -> Path:
+    def clone(self, url: str = "") -> Path:
         runner = Path(tempfile.mkdtemp(dir=self.tmp))
-        git_out(self.tmp, "clone", "-q", self.url, str(runner))
+        git_out(self.tmp, "clone", "-q", url or self.url, str(runner))
         return runner
+
+    def branch_pushes(self) -> tuple[Path, str]:
+        """Clone the vouched upstream and add two pushes to a branch: the
+        first vouches for OTHER_IP on the branch alone, the second uses both
+        addresses. Returns the clone and the first push's commit."""
+        runner = self.clone(self.vouched_url)
+        identity = ["-c", "user.email=test@example.com", "-c", "user.name=test"]
+        git_out(runner, "checkout", "-q", "-b", "feature")
+        both = f"{IP}{FIXTURE_OK}\n{OTHER_IP}{FIXTURE_OK}\n"
+        (runner / ALLOW).write_text(both, encoding="utf-8")
+        git_out(runner, "add", ALLOW)
+        git_out(runner, *identity, "commit", "-qm", "push 1: vouch on the branch")
+        before = git_out(runner, "rev-parse", "HEAD")
+        (runner / "more.txt").write_text(
+            f"host {IP}\nhost {OTHER_IP}\n", encoding="utf-8"
+        )
+        git_out(runner, "add", "more.txt")
+        git_out(runner, *identity, "commit", "-qm", "push 2: use both")
+        return runner, before
 
     def run_step(self, cwd: Path, **env: str) -> tuple[int, str, dict[str, str]]:
         """Run the step in cwd. Returns its exit code, output and step outputs."""
@@ -2231,6 +2383,9 @@ class ActionStepTests(unittest.TestCase):
                 "BASE_REF": "",
                 "PR_BASE_REF": "",
                 "PR_HEAD_SHA": "",
+                "EVENT_NAME": "",
+                "GIT_REF": "",
+                "DEFAULT_BRANCH": "",
                 "GITHUB_OUTPUT": outputs.as_posix(),
                 # Never the summary of the CI job running these tests.
                 "GITHUB_STEP_SUMMARY": outputs.with_name("step_summary").as_posix(),
@@ -2299,6 +2454,43 @@ class ActionStepTests(unittest.TestCase):
         # An empty input turns the allow file off.
         code, out, _outputs = self.run_step(runner, BASE_REF=base)
         self.assertEqual(code, 1, out)
+
+    def test_a_push_reads_the_allow_file_the_default_branch_has(self):
+        runner, before = self.branch_pushes()
+        push = {"BASE_REF": before, "ALLOW_FILE": ALLOW, "EVENT_NAME": "push"}
+        # To another branch, before is the pusher's own last push, so the
+        # list comes from main's tip, which vouches for IP alone.
+        code, out, _outputs = self.run_step(
+            runner, GIT_REF="refs/heads/feature", DEFAULT_BRANCH="main", **push
+        )
+        self.assertEqual(code, 1, out)
+        self.assertEqual(
+            FINDING_RE.findall(out), [("more.txt", "private/link-local IP")]
+        )
+        self.assertIn("::error file=more.txt,line=2::", out)
+        self.assertIn("(origin/main): 1 entry, 1 match(es) suppressed.", out)
+        # To main itself, before is main's own history.
+        code, out, _outputs = self.run_step(
+            runner, GIT_REF="refs/heads/main", DEFAULT_BRANCH="main", **push
+        )
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"at {before[:12]}: 2 entries, 2 match(es) suppressed.", out)
+
+    def test_a_default_branch_it_cannot_read_means_no_allow_file(self):
+        # Never before in its place, which vouches for both addresses.
+        runner, before = self.branch_pushes()
+        code, out, _outputs = self.run_step(
+            runner,
+            BASE_REF=before,
+            ALLOW_FILE=ALLOW,
+            EVENT_NAME="push",
+            GIT_REF="refs/heads/feature",
+            DEFAULT_BRANCH="trunk",
+        )
+        self.assertEqual(code, 1, out)
+        self.assertEqual(len(FINDING_RE.findall(out)), 2, out)
+        self.assertIn("::warning::Could not fetch the default branch", out)
+        self.assertIn("::notice::No allow file was read", out)
 
 
 @unittest.skipUnless(BASH, "needs bash, as a runner has")
