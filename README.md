@@ -77,6 +77,7 @@ jobs:
 | Input | Default | Meaning |
 |---|---|---|
 | `patterns-file` | *(none)* | Path to an extra denylist, one regular expression per line. `#` comments and blank lines are skipped. |
+| `allow-file` | `.redaction-allow` | Path to an allow file, one exact value per line, whose matches are counted instead of reported. It's read from the base commit, so an entry counts once it has merged, and it never applies to the allow file itself. `''` turns it off. See [Allowing a known value](#allowing-a-known-value). |
 | `fail-on` | `match` | `match` fails the step on any finding. `none` reports findings as warnings without failing on them, useful while first rolling the gate out on an existing repo. A diff that can't be computed fails the step either way. |
 | `scan-mode` | `added-lines` | `added-lines` scans only what the PR adds. `all-files` walks every git-tracked file instead, for a full-repo audit run. |
 | `base-ref` | *(auto)* | Branch to diff against, or a full commit SHA. Defaults to the pull request's base branch. A value that starts with `-` or holds a control character fails the step before any git command runs, since git would read it as an option. Set it explicitly when triggering on an event other than `pull_request`, and on `push` see [Running on push](#running-on-push). |
@@ -88,6 +89,8 @@ jobs:
 |---|---|
 | `exit-code` | The scan's exit code. `0` is clean, or findings under `fail-on: none`. `1` is findings. `2` is a scan that could not run, such as a `base-ref` it can't use or a diff it can't compute. |
 | `report` | Path to a file on the runner that holds the scanner's output, the same masked findings the log shows. |
+
+Each run also writes a short job summary with the number of findings and what the allow file let through.
 
 ## The masking guarantee
 
@@ -102,6 +105,27 @@ Add `redaction-ok` anywhere on the line and the scanner skips it:
 ```
 
 Reach for this when a line is a genuine placeholder that happens to match a pattern's shape, not when it's a real finding you'd rather not deal with. The marker is plain text, so `grep -rn redaction-ok` is enough for a reviewer to audit how often it's used and whether that use still holds up.
+
+## Allowing a known value
+
+Some values come back again and again and are safe every time, such as a Python module path that the `.local` check reads as a host. Instead of marking every line, list the value once in an allow file. By default that's `.redaction-allow` at the repository root, and the `allow-file` input points somewhere else.
+
+```text
+# Module paths that the .local check reads as hosts
+adapters.local  # redaction-ok: a Python module path, not a host
+```
+
+Put one value on each line. Blank lines and `#` comments are skipped, and so is the rest of a line after a `#` that follows whitespace. An entry shorter than four characters or holding whitespace is ignored, as is everything past the first 200 entries. Each ignored line gets a warning that names the line but never repeats its text.
+
+The match is exact and case-sensitive. A finding is let through only when the text its pattern matched is identical to an entry. Every other pattern still scans that line, and a value that contains an entry, or sits inside one, is still reported. A secret-shaped filename is never let through this way. The log and the job summary say how many matches the allow file let through.
+
+The list is always read from a commit the change under scan doesn't control:
+
+- **Pull requests and pushes (`added-lines`).** The allow file as the base commit has it, which is the commit GitHub built the test merge on, or the commit a push started from. The net diff and every commit in the range get that one list. An entry a pull request adds lets nothing through in that pull request. It starts counting once it has merged.
+- **`all-files`.** The allow file as `HEAD` has it. An uncommitted edit doesn't count.
+- **A diff on stdin or in `--diff-file` (running the script yourself).** There's no base to read from, so `--allow-file` is read from disk as given. Hand it the base's copy (`git show origin/main:.redaction-allow > base-allow/.redaction-allow`), never the branch's own.
+
+The list never applies to a file with the allow file's name, whatever the mode. The allow file's own lines are scanned like any other, so a real secret pasted into it is reported like a secret pasted anywhere else. So is an ordinary entry, because an entry has a finding's shape or it wouldn't be there. That's why the example line carries `redaction-ok`. The change that adds an entry fails until the entry's own line says why the value is safe, where a reviewer reads it and `grep -rn redaction-ok` finds it later.
 
 ## Honest limits
 

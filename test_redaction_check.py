@@ -1857,6 +1857,218 @@ class CommitHistoryTests(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# Allow file -- exact values a repository vouches for
+# ---------------------------------------------------------------------------
+
+# An mDNS-shaped value that is really a Python module path, the case the allow
+# file exists for.
+MODULE = "adapters" + ".local"
+OTHER_MODULE = "reports" + ".local"
+AWS_KEY = "AKIA" + "EXAMPLE000000000"
+ALLOW = ".redaction-allow"
+MARKED = "  # redaction-ok: a module path, not a host"
+
+
+def allow_list(*entries: str) -> rc.Allowlist:
+    return rc.Allowlist(frozenset(entries), ALLOW, found=True)
+
+
+def one_file_diff(path: str, *lines: str) -> str:
+    """A diff that adds path with these lines."""
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        f"+++ b/{path}\n"
+        f"@@ -0,0 +1,{len(lines)} @@\n" + "".join(f"+{ln}\n" for ln in lines)
+    )
+
+
+class AllowFileParsingTests(unittest.TestCase):
+    def parse(self, text: str) -> tuple[frozenset[str], list[str]]:
+        return rc.parse_allowlist(text, "Allow file .redaction-allow at HEAD")
+
+    def test_comments_and_blank_lines_are_skipped(self):
+        text = f"# module paths\n\n   \n{MODULE}{MARKED}\n\t# indented\nkey#part\n"
+        self.assertEqual(self.parse(text), ({MODULE, "key#part"}, []))
+
+    def test_short_and_whitespace_entries_are_ignored_with_a_warning(self):
+        key_header = "-----BEGIN " + "RSA PRIVATE KEY-----"
+        entries, warnings = self.parse(f"abc\n{MODULE}\n{key_header}\n  x  \n")
+        self.assertEqual(entries, {MODULE})
+        where = "Allow file .redaction-allow at HEAD, line"
+        self.assertEqual(
+            warnings,
+            [
+                f"{where} 1: entry ignored, shorter than 4 characters.",
+                f"{where} 3: entry ignored, it holds whitespace.",
+                f"{where} 4: entry ignored, shorter than 4 characters.",
+            ],
+        )
+        # The file may hold a real value, so a warning never repeats a line.
+        self.assertNotIn("abc", " ".join(warnings))
+        self.assertNotIn("PRIVATE", " ".join(warnings))
+
+    def test_the_list_is_capped(self):
+        cap = rc.ALLOW_MAX_ENTRIES
+        entries, warnings = self.parse(
+            "".join(f"value-{i:03d}\n" for i in range(cap + 5))
+        )
+        self.assertEqual(len(entries), cap)
+        self.assertIn("value-000", entries)
+        self.assertNotIn(f"value-{cap:03d}", entries)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn(f"5 entries from line {cap + 1} on ignored", warnings[0])
+
+    def test_a_utf16_allow_file_is_read(self):
+        # What PowerShell 5's `>` writes.
+        data = f"{MODULE}\r\n".encode("utf-16")
+        self.assertEqual(self.parse(rc.allow_text(data)), ({MODULE}, []))
+
+
+class AllowFileMatchingTests(unittest.TestCase):
+    def scan(self, allow: rc.Allowlist, line: str) -> list[tuple[str, bool]]:
+        found = rc.scan_added_lines(one_file_diff("app.py", line), allow=allow)
+        return [(f.label, f.allowed) for f in found]
+
+    def test_an_exact_match_is_suppressed(self):
+        self.assertEqual(
+            self.scan(allow_list(MODULE), f"from pkg.{MODULE} import load"),
+            [("mDNS/.local hostname", True)],
+        )
+
+    def test_another_finding_on_the_same_line_is_still_reported(self):
+        self.assertEqual(
+            self.scan(allow_list(MODULE), f"{MODULE} runs on {IP}"),
+            [("private/link-local IP", False), ("mDNS/.local hostname", True)],
+        )
+
+    def test_a_substring_or_superstring_is_still_reported(self):
+        for text, entry in [
+            ("my" + MODULE, MODULE),  # the match holds the entry
+            (MODULE, "my" + MODULE),  # the match sits inside the entry
+            (MODULE, MODULE.upper()),  # case counts
+            (IP, IP[:-1]),
+        ]:
+            with self.subTest(text=text, entry=entry):
+                found = self.scan(allow_list(entry), f"see {text} here")
+                self.assertEqual([allowed for _label, allowed in found], [False])
+
+    def test_a_secret_filename_is_never_allowed(self):
+        diff = one_file_diff(".env", "K=value")
+        found = rc.scan_added_lines(diff, allow=allow_list(".env", "K=value"))
+        self.assertEqual(
+            [(f.label, f.allowed) for f in found], [("dotenv file", False)]
+        )
+
+
+class AllowFileModeTests(unittest.TestCase):
+    """Where each mode reads the list from. Never from the change it scans."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = ScratchRepo(tmp.name)
+
+    def scan(self, *argv: str) -> tuple[int, str]:
+        root = ["--root", str(self.repo.path), "--allow-file", ALLOW]
+        code, out, err = run_main([*argv, *root])
+        for value in [MODULE, OTHER_MODULE, AWS_KEY]:
+            self.assertNotIn(value, out + err)  # the masking guarantee
+        return code, out
+
+    def test_pr_mode_reads_the_base_so_an_entry_the_head_adds_allows_nothing(self):
+        self.repo.write(ALLOW, f"{MODULE}\n".encode())
+        self.repo.commit("allow the module path on main")
+        base_tip = self.repo.head()
+        git_out(self.repo.path, "checkout", "-q", "-b", "feature")
+        self.repo.write(ALLOW, f"{MODULE}\n{OTHER_MODULE}{MARKED}\n".encode())
+        self.repo.write(
+            "app.py", f"import pkg.{MODULE}\nimport pkg.{OTHER_MODULE}\n".encode()
+        )
+        self.repo.commit("use both, and allow the second as well")
+        pr_head = self.repo.head()
+        # GitHub's test merge: first parent main's tip, second the head.
+        git_out(self.repo.path, "checkout", "-q", "--detach", base_tip)
+        git_out(self.repo.path, "merge", "-q", "--no-ff", "-m", "M", pr_head)
+        code, out = self.scan("--base", "main", "--pr-head", pr_head)
+        self.assertEqual(code, 1)
+        self.assertIn("test-merge commit", out)
+        self.assertEqual(FINDING_RE.findall(out), [("app.py", "mDNS/.local hostname")])
+        self.assertIn("::error file=app.py,line=2::", out)
+        self.assertIn(
+            f"at {base_tip[:12]} (the scanned range's base): 1 entry, 1 ", out
+        )
+
+    def test_each_commit_gets_the_base_list_not_its_parent_s(self):
+        self.repo.write(ALLOW, f"{MODULE}{MARKED}\n".encode())
+        self.repo.commit("allow the module path")
+        self.repo.write("app.py", f"import pkg.{MODULE}\n".encode())
+        self.repo.commit("use it")
+        used = self.repo.head()
+        self.repo.write("app.py", b"import pkg.other\n")
+        self.repo.commit("stop using it")
+        code, out = self.scan("--base", "HEAD~3")
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            COMMIT_FINDING_RE.findall(out),
+            [("app.py", "mDNS/.local hostname", used[:12])],
+        )
+        self.assertIn(": none at ", out)
+
+    def test_all_files_reads_the_list_as_head_has_it(self):
+        self.repo.write(ALLOW, f"{MODULE}{MARKED}\n".encode())
+        self.repo.write(
+            "app.py", f"import pkg.{MODULE}\nimport pkg.{OTHER_MODULE}\n".encode()
+        )
+        self.repo.commit("add")
+        # An entry that is not committed is not on the list.
+        self.repo.write(ALLOW, f"{MODULE}{MARKED}\n{OTHER_MODULE}{MARKED}\n".encode())
+        code, out = self.scan("--mode", "all-files")
+        self.assertEqual(code, 1)
+        self.assertEqual(FINDING_RE.findall(out), [("app.py", "mDNS/.local hostname")])
+        self.assertIn("::error file=app.py,line=2::", out)
+        self.assertIn("at HEAD: 1 entry, 1 match(es) suppressed", out)
+
+    def test_a_secret_put_in_the_allow_file_is_reported(self):
+        self.repo.write(ALLOW, f"{AWS_KEY}\n".encode())
+        self.repo.write("deploy.sh", f"export KEY={AWS_KEY}\n".encode())
+        self.repo.commit("vouch for a real key")
+        label = "AWS access key ID"
+        # The base had no entry, so both lines are reported.
+        code, out = self.scan("--base", "HEAD~1")
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            sorted(FINDING_RE.findall(out)), [(ALLOW, label), ("deploy.sh", label)]
+        )
+        # HEAD has the entry, but the list never covers the allow file itself.
+        code, out = self.scan("--mode", "all-files")
+        self.assertEqual((code, FINDING_RE.findall(out)), (1, [(ALLOW, label)]))
+        # Nor does it when a caller hands over the branch's own copy.
+        diff = rc.get_diff_via_git("HEAD~1", str(self.repo.path))
+        argv = ["--allow-file", str(self.repo.path / ALLOW)]
+        code, out, err = run_main(argv, stdin_text=diff)
+        self.assertEqual((code, FINDING_RE.findall(out)), (1, [(ALLOW, label)]))
+        self.assertNotIn(AWS_KEY, out + err)
+
+    def test_a_diff_on_stdin_reads_the_file_named_and_writes_the_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            allow = Path(tmp) / ALLOW
+            allow.write_text(f"{MODULE}\n", encoding="utf-8")
+            summary = Path(tmp) / "summary.md"
+            argv = ["--allow-file", str(allow), "--summary-file", str(summary)]
+            diff = one_file_diff("app.py", f"import pkg.{MODULE}", f"host {IP}")
+            code, out, _err = run_main(argv, stdin_text=diff)
+            text = summary.read_text(encoding="utf-8")
+        self.assertEqual(code, 1)
+        self.assertEqual(FINDING_RE.findall(out), [("app.py", "private/link-local IP")])
+        self.assertIn("on disk: 1 entry, 1 match(es) suppressed.", out)
+        self.assertIn("- Findings: 1\n", text)
+        self.assertIn("on disk: 1 entry, 1 match(es) suppressed.", text)
+        self.assertNotIn(MODULE, out + text)
+
+
 class ActionDefinitionTests(unittest.TestCase):
     """These tests never run action.yml's shell step, so guard its key lines."""
 
@@ -1882,6 +2094,16 @@ class ActionDefinitionTests(unittest.TestCase):
         self.assertIsNotNone(declared)
         self.assertIn("default: 'false'", declared.group(0))
         self.assertTrue(any("--skip-scanner-files" in ln for ln in self.code))
+
+    def test_the_allow_file_is_read_by_default(self):
+        text = (THIS_DIR / "action.yml").read_text(encoding="utf-8")
+        declared = re.search(r"\n  allow-file:\n(?:    .*\n)+", text)
+        self.assertIsNotNone(declared)
+        self.assertIn("default: .redaction-allow", declared.group(0))
+        self.assertTrue(any('"--allow-file=$ALLOW_FILE"' in ln for ln in self.code))
+        self.assertTrue(
+            any('"--summary-file=$GITHUB_STEP_SUMMARY"' in ln for ln in self.code)
+        )
 
     def test_the_pull_request_head_reaches_the_scanner(self):
         self.assertTrue(
@@ -2004,11 +2226,14 @@ class ActionStepTests(unittest.TestCase):
                 "FAIL_ON": "match",
                 "SCAN_MODE": "added-lines",
                 "PATTERNS_FILE": "",
+                "ALLOW_FILE": "",
                 "SKIP_SCANNER_FILES": "false",
                 "BASE_REF": "",
                 "PR_BASE_REF": "",
                 "PR_HEAD_SHA": "",
                 "GITHUB_OUTPUT": outputs.as_posix(),
+                # Never the summary of the CI job running these tests.
+                "GITHUB_STEP_SUMMARY": outputs.with_name("step_summary").as_posix(),
                 "RUNNER_TEMP": self.tmp.as_posix(),
                 **env,
             },
@@ -2049,6 +2274,31 @@ class ActionStepTests(unittest.TestCase):
         code, out, outputs = self.run_step(self.clone(), BASE_REF=self.base, PYTHON="")
         self.assertEqual((code, outputs["exit-code"]), (2, "2"), out)
         self.assertIn("::error::The Set up Python step gave no python-path", out)
+
+    def test_the_allow_file_is_read_from_the_base_and_counted(self):
+        runner = self.clone()
+        identity = ["-c", "user.email=test@example.com", "-c", "user.name=test"]
+        (runner / ALLOW).write_text(f"{IP}\n", encoding="utf-8")
+        git_out(runner, "add", ALLOW)
+        git_out(runner, *identity, "commit", "-qm", "allow the host")
+        base = git_out(runner, "rev-parse", "HEAD")
+        (runner / "more.txt").write_text(f"host {IP}\n", encoding="utf-8")
+        git_out(runner, "add", "more.txt")
+        git_out(runner, *identity, "commit", "-qm", "use it again")
+        summary = Path(tempfile.mkdtemp(dir=self.tmp)) / "summary.md"
+        code, out, outputs = self.run_step(
+            runner,
+            BASE_REF=base,
+            ALLOW_FILE=ALLOW,
+            GITHUB_STEP_SUMMARY=summary.as_posix(),
+        )
+        self.assertEqual((code, outputs["exit-code"]), (0, "0"), out)
+        counted = "1 entry, 1 match(es) suppressed."
+        self.assertIn(counted, Path(outputs["report"]).read_text(encoding="utf-8"))
+        self.assertIn(counted, summary.read_text(encoding="utf-8"))
+        # An empty input turns the allow file off.
+        code, out, _outputs = self.run_step(runner, BASE_REF=base)
+        self.assertEqual(code, 1, out)
 
 
 @unittest.skipUnless(BASH, "needs bash, as a runner has")

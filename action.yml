@@ -17,6 +17,17 @@ inputs:
       # are skipped.
     required: false
     default: ''
+  allow-file:
+    description: >-
+      Path (relative to the checkout) to an optional allow file, one exact
+      value per line, whose matches are counted instead of reported. Blank
+      lines and # comments are skipped. In added-lines mode it is read as
+      the base commit has it, so an entry a pull request adds lets nothing
+      through until it has merged. In all-files mode it is read as HEAD has
+      it. It never applies to the allow file itself. Set it to '' to turn it
+      off.
+    required: false
+    default: .redaction-allow
   fail-on:
     description: >-
       'match' (default) fails the step when any finding is reported. 'none'
@@ -84,6 +95,7 @@ runs:
       env:
         PYTHON: ${{ steps.py.outputs.python-path }}
         PATTERNS_FILE: ${{ inputs.patterns-file }}
+        ALLOW_FILE: ${{ inputs.allow-file }}
         FAIL_ON: ${{ inputs.fail-on }}
         SCAN_MODE: ${{ inputs.scan-mode }}
         BASE_REF: ${{ inputs.base-ref || github.base_ref }}
@@ -108,6 +120,14 @@ runs:
         args=(--fail-on "$FAIL_ON")
         if [ -n "$PATTERNS_FILE" ]; then
           args+=(--patterns-file "$PATTERNS_FILE")
+        fi
+        # The scanner reads it from a commit, never from this checkout: the
+        # base in added-lines mode, HEAD in all-files mode.
+        if [ -n "$ALLOW_FILE" ]; then
+          args+=("--allow-file=$ALLOW_FILE")
+        fi
+        if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+          args+=("--summary-file=$GITHUB_STEP_SUMMARY")
         fi
         if [ "$SKIP_SCANNER_FILES" = "true" ]; then
           args+=(--skip-scanner-files)
