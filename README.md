@@ -72,11 +72,37 @@ jobs:
 
 `base-ref` takes a full commit SHA as well as a branch name. The push that creates a branch has no earlier commit (`github.event.before` is all zeros), so that one run fails with an error rather than passing.
 
+On a push to any other branch, diff against the default branch instead. That scans everything the branch adds, the push that creates it included:
+
+```yaml
+on:
+  push:
+    branches-ignore: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  redaction:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: jimy-r/redaction-check-action@v1
+        with:
+          base-ref: ${{ github.event.repository.default_branch }}
+```
+
+On such a push the allow file comes from the default branch's tip, whatever `base-ref` says, and never from the branch being pushed. See [Where the list comes from](#where-the-list-comes-from).
+
 ## Inputs
 
 | Input | Default | Meaning |
 |---|---|---|
 | `patterns-file` | *(none)* | Path to an extra denylist, one regular expression per line. `#` comments and blank lines are skipped. |
+| `allow-file` | `.redaction-allow` | Path to an allow file, one exact value per line, whose matches are counted instead of reported. `added-lines` mode reads it from a commit outside the change, such as the pull request's base, so an entry counts once it has landed. `all-files` mode reads it from `HEAD`. It never applies to the allow file itself. `''` turns it off. See [Where the list comes from](#where-the-list-comes-from). |
 | `fail-on` | `match` | `match` fails the step on any finding. `none` reports findings as warnings without failing on them, useful while first rolling the gate out on an existing repo. A diff that can't be computed fails the step either way. |
 | `scan-mode` | `added-lines` | `added-lines` scans only what the PR adds. `all-files` walks every git-tracked file instead, for a full-repo audit run. |
 | `base-ref` | *(auto)* | Branch to diff against, or a full commit SHA. Defaults to the pull request's base branch. The action fetches a branch and reads it by its full name, `refs/remotes/origin/<branch>`, since git reads a short `origin/<branch>` as a tag or a local branch of that name first. A value that starts with `-` or holds a control character fails the step before any git command runs, since git would read it as an option. Set it explicitly when triggering on an event other than `pull_request`, and on `push` see [Running on push](#running-on-push). |
@@ -88,6 +114,8 @@ jobs:
 |---|---|
 | `exit-code` | The scan's exit code. `0` is clean, or findings under `fail-on: none`. `1` is findings. `2` is a scan that could not run, such as a `base-ref` it can't use or a diff it can't compute. |
 | `report` | Path to a file on the runner that holds the scanner's output, the same masked findings the log shows. |
+
+Each run also writes a short job summary with the number of findings and what the allow file let through.
 
 ## The masking guarantee
 
@@ -103,9 +131,41 @@ Add `redaction-ok` anywhere on the line and the scanner skips it:
 
 Reach for this when a line is a genuine placeholder that happens to match a pattern's shape, not when it's a real finding you'd rather not deal with. The marker is plain text, so `grep -rn redaction-ok` is enough for a reviewer to audit how often it's used and whether that use still holds up.
 
+## Allowing a known value
+
+Some values come back again and again and are safe every time, such as a Python module path that the `.local` check reads as a host. Instead of marking every line, list the value once in an allow file. By default that's `.redaction-allow` at the repository root, and the `allow-file` input points somewhere else.
+
+```text
+# Module paths that the .local check reads as hosts
+adapters.local  # redaction-ok: a Python module path, not a host
+```
+
+Put one value on each line. Blank lines and `#` comments are skipped, and so is the rest of a line after a `#` that follows whitespace. An entry is ignored if it's shorter than four characters or holds whitespace. So is one holding U+FFFD, the character every byte that isn't valid text decodes to, since it would match any such byte. Everything past the first 200 entries is ignored too. Each ignored line gets a warning that names the line but never repeats its text.
+
+The match is exact and case-sensitive. A finding is let through only when the text its pattern matched is identical to an entry. Every other pattern still scans that line, and a value that contains an entry, or sits inside one, is still reported. A secret-shaped filename is never let through this way. The log and the job summary say how many matches the allow file let through.
+
+### Where the list comes from
+
+In `added-lines` mode the list is read from a commit outside the change under scan, so an entry a pull request or push adds lets nothing through in that same change. It counts once it has landed. The net diff and every commit in the range get that one list. Which commit depends on the checkout:
+
+- **A pull request's test merge**, the default checkout on `pull_request`. The commit GitHub built the test merge on, the base branch's tip at that moment.
+- **Any other pull-request checkout, or a `base-ref` set by hand.** The base as it is now. That's the tip of the base branch, which the action fetches first, or the commit a SHA `base-ref` names. It covers `pull_request_target` and any other checkout of the pull request's head, and the script's own `--base`. It's never the merge base, where a branch that forked before the base dropped an entry would still find it.
+- **A push to the default branch.** The commit the push started from, `github.event.before`, which is that branch's own history.
+- **A push to any other branch.** The default branch's tip. There `github.event.before` is the branch's own previous push, which the pusher wrote, so an entry added in one push would count from the next without review.
+
+The action names both branches in full, as `refs/remotes/origin/<name>`. git reads a short `origin/<name>` as a tag or a local branch of that name first, and a push to a branch called `origin/main` leaves just such a local branch in the checkout, whose own list would then count. The script refuses a `--base` or `--allow-ref` that could be more than one ref, so the scan exits 2 rather than read a list from the wrong commit.
+
+If that commit isn't in the clone (a shallow checkout whose fetch of the default branch failed, say), the scan reads no allow file at all and a notice says so. It never falls back to the branch's own copy.
+
+In `all-files` mode there's no change under scan. The list is read as `HEAD` commits it, so an uncommitted edit doesn't count toward it. The allow file itself is scanned in both forms, the committed copy whatever its size and the copy in the working tree, so a value in an edit not yet committed is still reported. A value both copies hold is reported once.
+
+A diff on stdin or in `--diff-file`, when you run the script yourself, has no base to read from, so `--allow-file` is read from disk as given. Hand it the base's copy (`git show refs/remotes/origin/main:.redaction-allow > base-allow.txt`), never the branch's own. The allow file's own lines in the diff are known by their path there, `.redaction-allow` unless `--allow-path` names another, whatever the copy on disk is called.
+
+The list never applies to a file with the allow file's name, whatever the mode. The allow file's own lines are scanned like any other, so a real secret pasted into it is reported like a secret pasted anywhere else. So is an ordinary entry, because an entry has a finding's shape or it wouldn't be there. That's why the example line carries `redaction-ok`. The change that adds an entry fails until the entry's own line says why the value is safe, where a reviewer reads it and `grep -rn redaction-ok` finds it later.
+
 ## Honest limits
 
-Shape-based scanning has real edges. A `.pem` file gets flagged whether it holds a private key or a public certificate, since a filename alone can't tell the difference. The built-in patterns are deliberately narrow. They cover the classes that show up most in a fast-moving or agent-assisted repo, not every credential format that exists, so an org with its own token formats should add them through `patterns-file` rather than expect this action to guess them. IPv6 addresses aren't covered in v0.1. Images, fonts, compressed archives and audio or video files are checked by name only, as long as the file starts with its format's signature bytes. Real ones are full of byte runs shaped like emails and paths, so scanning their bytes would fail ordinary pull requests. A text file that only has one of those names is scanned, and so is an uncompressed `.tar`, which holds its files as they are.
+Shape-based scanning has real edges. A `.pem` file gets flagged whether it holds a private key or a public certificate, since a filename alone can't tell the difference. The built-in patterns are deliberately narrow. They cover the classes that show up most in a fast-moving or agent-assisted repo, not every credential format that exists, so an org with its own token formats should add them through `patterns-file` rather than expect this action to guess them. IPv6 addresses aren't covered in v0.1. Images, fonts, compressed archives and audio or video files are checked by name only, as long as the file starts with its format's signature bytes. Real ones are full of byte runs shaped like emails and paths, so scanning their bytes would fail ordinary pull requests. A text file that only has one of those names is scanned, and so is an uncompressed `.tar`, which holds its files as they are. A pattern never reports two matches that overlap. When two private addresses run together and the second starts inside the first, the IP check finds only the first, so an allow-file entry for the first lets the whole run through.
 
 A clean run is a floor, not a ceiling. It means nothing here matched a known shape, which is a different claim from "a human read this diff and agreed." Pattern matching complements review; it was never going to replace it.
 

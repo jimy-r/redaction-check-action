@@ -1462,6 +1462,17 @@ class RewrittenBaseTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("file=leak.txt", out)
 
+    def test_a_rewritten_base_gives_the_allow_file_from_its_tip(self):
+        # The widened range starts at the merge base, before the rewrite, so
+        # the list comes from the base as it now stands.
+        runner = self.checkout()
+        frm, to, _how = rc.resolve_diff_range("origin/main", runner, self.pr_head)
+        tip = git_out(runner, "rev-parse", "origin/main")
+        self.assertEqual(
+            rc.allow_source("origin/main", frm, to, runner, self.pr_head),
+            (tip, f"at {tip[:12]} (origin/main)"),
+        )
+
     def test_rewritten_base_without_history_to_widen_from_is_an_error(self):
         # At depth 1 the first parent arrives by deepening, as a shallow
         # boundary, so no merge base is visible. The base's own history is
@@ -2030,6 +2041,545 @@ class CommitHistoryTests(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# Allow file -- exact values a repository vouches for
+# ---------------------------------------------------------------------------
+
+# An mDNS-shaped value that is really a Python module path, the case the allow
+# file exists for.
+MODULE = "adapters" + ".local"
+OTHER_MODULE = "reports" + ".local"
+AWS_KEY = "AKIA" + "EXAMPLE000000000"
+OTHER_IP = "10.20.30.41"
+ALLOW = ".redaction-allow"
+MARKED = "  # redaction-ok: a module path, not a host"
+FIXTURE_OK = "  # redaction-ok: a test fixture"
+
+
+def allow_list(*entries: str) -> rc.Allowlist:
+    return rc.Allowlist(frozenset(entries), ALLOW, found=True)
+
+
+def one_file_diff(path: str, *lines: str) -> str:
+    """A diff that adds path with these lines."""
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        f"+++ b/{path}\n"
+        f"@@ -0,0 +1,{len(lines)} @@\n" + "".join(f"+{ln}\n" for ln in lines)
+    )
+
+
+class AllowFileParsingTests(unittest.TestCase):
+    def parse(self, text: str) -> tuple[frozenset[str], list[str]]:
+        return rc.parse_allowlist(text, "Allow file .redaction-allow at HEAD")
+
+    def test_comments_and_blank_lines_are_skipped(self):
+        text = f"# module paths\n\n   \n{MODULE}{MARKED}\n\t# indented\nkey#part\n"
+        self.assertEqual(self.parse(text), ({MODULE, "key#part"}, []))
+
+    def test_short_and_whitespace_entries_are_ignored_with_a_warning(self):
+        key_header = "-----BEGIN " + "RSA PRIVATE KEY-----"
+        entries, warnings = self.parse(f"abc\n{MODULE}\n{key_header}\n  x  \n")
+        self.assertEqual(entries, {MODULE})
+        where = "Allow file .redaction-allow at HEAD, line"
+        self.assertEqual(
+            warnings,
+            [
+                f"{where} 1: entry ignored, shorter than 4 characters.",
+                f"{where} 3: entry ignored, it holds whitespace.",
+                f"{where} 4: entry ignored, shorter than 4 characters.",
+            ],
+        )
+        # The file may hold a real value, so a warning never repeats a line.
+        self.assertNotIn("abc", " ".join(warnings))
+        self.assertNotIn("PRIVATE", " ".join(warnings))
+
+    def test_the_list_is_capped(self):
+        cap = rc.ALLOW_MAX_ENTRIES
+        entries, warnings = self.parse(
+            "".join(f"value-{i:03d}\n" for i in range(cap + 5))
+        )
+        self.assertEqual(len(entries), cap)
+        self.assertIn("value-000", entries)
+        self.assertNotIn(f"value-{cap:03d}", entries)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn(f"5 entries from line {cap + 1} on ignored", warnings[0])
+
+    def test_a_utf16_allow_file_is_read(self):
+        # What PowerShell 5's `>` writes.
+        data = f"{MODULE}\r\n".encode("utf-16")
+        self.assertEqual(self.parse(rc.allow_text(data)), ({MODULE}, []))
+
+    def test_a_utf16_be_or_utf8_bom_is_read(self):
+        for data in (
+            b"\xfe\xff" + f"{MODULE}\n".encode("utf-16-be"),
+            b"\xef\xbb\xbf" + f"{MODULE}\n".encode(),
+        ):
+            with self.subTest(bom=data[:3]):
+                self.assertEqual(self.parse(rc.allow_text(data)), ({MODULE}, []))
+
+    def test_an_entry_is_trimmed_at_both_ends(self):
+        text = f"  {MODULE}\n\t{OTHER_MODULE}\t# why\n"
+        self.assertEqual(self.parse(text), ({MODULE, OTHER_MODULE}, []))
+
+    def test_a_four_character_entry_is_kept(self):
+        self.assertEqual(self.parse("a.io\n"), ({"a.io"}, []))
+
+    def test_the_cap_counts_unique_valid_entries_only(self):
+        # Comments, blanks, ignored lines and repeats take no place on it.
+        lines = ["# c", "", "abc"] * 50 + ["value-000"] * 50
+        lines += [f"value-{i:03d}" for i in range(201)]
+        entries, warnings = self.parse("\n".join(lines))
+        self.assertEqual(len(entries), 200)
+        self.assertIn("value-199", entries)
+        self.assertNotIn("value-200", entries)
+        self.assertEqual(sum("past the first" in w for w in warnings), 1)
+
+    def test_an_entry_holding_a_byte_that_is_not_text_is_ignored(self):
+        # Every such byte decodes to U+FFFD, in the scanned lines too, so the
+        # entry would cover values with any other such byte in its place.
+        entries, warnings = self.parse(rc.allow_text(b"tok=ab\xff\n" + b"a.io\n"))
+        self.assertEqual(entries, {"a.io"})
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("line 1: entry ignored, it holds U+FFFD", warnings[0])
+
+
+class AllowFileMatchingTests(unittest.TestCase):
+    def scan(self, allow: rc.Allowlist, line: str) -> list[tuple[str, bool]]:
+        found = rc.scan_added_lines(one_file_diff("app.py", line), allow=allow)
+        return [(f.label, f.allowed) for f in found]
+
+    def test_an_exact_match_is_suppressed(self):
+        self.assertEqual(
+            self.scan(allow_list(MODULE), f"from pkg.{MODULE} import load"),
+            [("mDNS/.local hostname", True)],
+        )
+
+    def test_another_finding_on_the_same_line_is_still_reported(self):
+        self.assertEqual(
+            self.scan(allow_list(MODULE), f"{MODULE} runs on {IP}"),
+            [("private/link-local IP", False), ("mDNS/.local hostname", True)],
+        )
+
+    def test_a_substring_or_superstring_is_still_reported(self):
+        for text, entry in [
+            ("my" + MODULE, MODULE),  # the match holds the entry
+            (MODULE, "my" + MODULE),  # the match sits inside the entry
+            (MODULE, MODULE.upper()),  # case counts
+            (IP, IP[:-1]),
+        ]:
+            with self.subTest(text=text, entry=entry):
+                found = self.scan(allow_list(entry), f"see {text} here")
+                self.assertEqual([allowed for _label, allowed in found], [False])
+
+    def test_a_secret_filename_is_never_allowed(self):
+        diff = one_file_diff(".env", "K=value")
+        found = rc.scan_added_lines(diff, allow=allow_list(".env", "K=value"))
+        self.assertEqual(
+            [(f.label, f.allowed) for f in found], [("dotenv file", False)]
+        )
+
+    def test_an_entry_with_a_byte_that_is_not_text_covers_nothing(self):
+        entries, _warnings = rc.parse_allowlist(rc.allow_text(b"tok=ab\xff\n"), "x")
+        allow = rc.Allowlist(entries, ALLOW, found=True)
+        custom = [("custom", re.compile(r"tok=\S+"))]
+        diff = one_file_diff("c.txt", rc._text(b"tok=ab\x80"))
+        found = rc.scan_added_lines(diff, custom, allow=allow)
+        self.assertEqual([f.allowed for f in found], [False])
+
+    def test_an_allowed_ip_hides_an_ip_that_overlaps_it(self):
+        # A limit the README states: a pattern never reports two matches that
+        # overlap. The second address here starts inside the first and is
+        # never found, so allowing the first lets the whole run through.
+        self.assertEqual(
+            self.scan(allow_list("10.0.0.10"), "route 10.0.0.10.0.0.2"),
+            [("private/link-local IP", True)],
+        )
+
+
+class AllowFileModeTests(unittest.TestCase):
+    """Where each mode reads the list from. Never from the change it scans."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = ScratchRepo(tmp.name)
+
+    def scan(self, *argv: str) -> tuple[int, str]:
+        root = ["--root", str(self.repo.path), "--allow-file", ALLOW]
+        code, out, err = run_main([*argv, *root])
+        for value in [MODULE, OTHER_MODULE, AWS_KEY]:
+            self.assertNotIn(value, out + err)  # the masking guarantee
+        return code, out
+
+    def test_pr_mode_reads_the_base_so_an_entry_the_head_adds_allows_nothing(self):
+        self.repo.write(ALLOW, f"{MODULE}\n".encode())
+        self.repo.commit("allow the module path on main")
+        base_tip = self.repo.head()
+        git_out(self.repo.path, "checkout", "-q", "-b", "feature")
+        self.repo.write(ALLOW, f"{MODULE}\n{OTHER_MODULE}{MARKED}\n".encode())
+        self.repo.write(
+            "app.py", f"import pkg.{MODULE}\nimport pkg.{OTHER_MODULE}\n".encode()
+        )
+        self.repo.commit("use both, and allow the second as well")
+        pr_head = self.repo.head()
+        # GitHub's test merge: first parent main's tip, second the head.
+        git_out(self.repo.path, "checkout", "-q", "--detach", base_tip)
+        git_out(self.repo.path, "merge", "-q", "--no-ff", "-m", "M", pr_head)
+        code, out = self.scan("--base", "main", "--pr-head", pr_head)
+        self.assertEqual(code, 1)
+        self.assertIn("test-merge commit", out)
+        self.assertEqual(FINDING_RE.findall(out), [("app.py", "mDNS/.local hostname")])
+        self.assertIn("::error file=app.py,line=2::", out)
+        self.assertIn(
+            f"at {base_tip[:12]} (the commit the test merge was built on): 1 entry, 1 ",
+            out,
+        )
+
+    def test_each_commit_gets_the_base_list_not_its_parent_s(self):
+        self.repo.write(ALLOW, f"{MODULE}{MARKED}\n".encode())
+        self.repo.commit("allow the module path")
+        self.repo.write("app.py", f"import pkg.{MODULE}\n".encode())
+        self.repo.commit("use it")
+        used = self.repo.head()
+        self.repo.write("app.py", b"import pkg.other\n")
+        self.repo.commit("stop using it")
+        code, out = self.scan("--base", "HEAD~3")
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            COMMIT_FINDING_RE.findall(out),
+            [("app.py", "mDNS/.local hostname", used[:12])],
+        )
+        self.assertIn(": none at ", out)
+
+    def test_all_files_reads_the_list_as_head_has_it(self):
+        self.repo.write(ALLOW, f"{MODULE}{MARKED}\n".encode())
+        self.repo.write(
+            "app.py", f"import pkg.{MODULE}\nimport pkg.{OTHER_MODULE}\n".encode()
+        )
+        self.repo.commit("add")
+        # An entry that is not committed is not on the list.
+        self.repo.write(ALLOW, f"{MODULE}{MARKED}\n{OTHER_MODULE}{MARKED}\n".encode())
+        code, out = self.scan("--mode", "all-files")
+        self.assertEqual(code, 1)
+        self.assertEqual(FINDING_RE.findall(out), [("app.py", "mDNS/.local hostname")])
+        self.assertIn("::error file=app.py,line=2::", out)
+        self.assertIn("at HEAD: 1 entry, 1 match(es) suppressed", out)
+
+    def test_a_secret_put_in_the_allow_file_is_reported(self):
+        self.repo.write(ALLOW, f"{AWS_KEY}\n".encode())
+        self.repo.write("deploy.sh", f"export KEY={AWS_KEY}\n".encode())
+        self.repo.commit("vouch for a real key")
+        label = "AWS access key ID"
+        # The base had no entry, so both lines are reported.
+        code, out = self.scan("--base", "HEAD~1")
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            sorted(FINDING_RE.findall(out)), [(ALLOW, label), ("deploy.sh", label)]
+        )
+        # HEAD has the entry, but the list never covers the allow file itself.
+        code, out = self.scan("--mode", "all-files")
+        self.assertEqual((code, FINDING_RE.findall(out)), (1, [(ALLOW, label)]))
+        # Nor does it when a caller hands over the branch's own copy.
+        diff = rc.get_diff_via_git("HEAD~1", str(self.repo.path))
+        argv = ["--allow-file", str(self.repo.path / ALLOW)]
+        code, out, err = run_main(argv, stdin_text=diff)
+        self.assertEqual((code, FINDING_RE.findall(out)), (1, [(ALLOW, label)]))
+        self.assertNotIn(AWS_KEY, out + err)
+
+    def test_a_diff_on_stdin_reads_the_file_named_and_writes_the_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            allow = Path(tmp) / ALLOW
+            allow.write_text(f"{MODULE}\n", encoding="utf-8")
+            summary = Path(tmp) / "summary.md"
+            argv = ["--allow-file", str(allow), "--summary-file", str(summary)]
+            diff = one_file_diff("app.py", f"import pkg.{MODULE}", f"host {IP}")
+            code, out, _err = run_main(argv, stdin_text=diff)
+            text = summary.read_text(encoding="utf-8")
+        self.assertEqual(code, 1)
+        self.assertEqual(FINDING_RE.findall(out), [("app.py", "private/link-local IP")])
+        self.assertIn("on disk: 1 entry, 1 match(es) suppressed.", out)
+        self.assertIn("- Findings: 1\n", text)
+        self.assertIn("on disk: 1 entry, 1 match(es) suppressed.", text)
+        self.assertNotIn(MODULE, out + text)
+
+    def fork_then_move_main(self, at_fork: str, later: str) -> str:
+        """Give main's allow file at_fork, fork feature, which uses MODULE, then
+        give main's allow file later. Returns feature's head, checked out."""
+        self.repo.write(ALLOW, at_fork.encode())
+        self.repo.commit("main's list when feature forks")
+        git_out(self.repo.path, "checkout", "-q", "-b", "feature")
+        self.repo.write("app.py", f"import pkg.{MODULE}\n".encode())
+        self.repo.commit("use it")
+        head = self.repo.head()
+        git_out(self.repo.path, "checkout", "-q", "main")
+        self.repo.write(ALLOW, later.encode())
+        self.repo.commit("main's list moves on")
+        git_out(self.repo.path, "checkout", "-q", "feature")
+        return head
+
+    def test_a_checkout_of_the_head_reads_the_base_as_it_is_now(self):
+        # The head checked out, as with pull_request_target or ref: head.sha,
+        # and --base alone, as for a base-ref set by hand. The list used to
+        # come from the merge base, where feature forked, so an entry main
+        # had removed since still counted.
+        head = self.fork_then_move_main(f"{MODULE}{MARKED}\n", "# revoked\n")
+        main = git_out(self.repo.path, "rev-parse", "main")
+        for pr_head in (["--pr-head", head], []):
+            with self.subTest(pr_head=pr_head):
+                code, out = self.scan("--base", "main", *pr_head)
+                self.assertEqual(code, 1, out)
+                self.assertIn(f"at {main[:12]} (main): 0 entries, 0 ", out)
+
+    def test_an_entry_the_base_gains_after_the_fork_counts(self):
+        head = self.fork_then_move_main("# none yet\n", f"{MODULE}{MARKED}\n")
+        code, out = self.scan("--base", "main", "--pr-head", head)
+        self.assertEqual(code, 0, out)
+        self.assertIn("(main): 1 entry, 1 match(es) suppressed.", out)
+
+    def test_the_test_merge_reads_the_commit_it_was_built_on(self):
+        # A base that moves on while the check is queued doesn't change it.
+        head = self.fork_then_move_main("# none yet\n", f"{MODULE}{MARKED}\n")
+        built_on = git_out(self.repo.path, "rev-parse", "main~1")
+        git_out(self.repo.path, "checkout", "-q", "--detach", built_on)
+        git_out(self.repo.path, "merge", "-q", "--no-ff", "-m", "M", head)
+        code, out = self.scan("--base", "main", "--pr-head", head)
+        self.assertEqual(code, 1, out)
+        where = f"at {built_on[:12]} (the commit the test merge was built on)"
+        self.assertIn(f"{where}: 0 entries, 0 match(es) suppressed.", out)
+
+    def test_a_push_range_reads_its_base_unless_allow_ref_names_another(self):
+        # Pushed to main, before is main's own history. Pushed to another
+        # branch, before is the pusher's last push, so the action names the
+        # default branch in --allow-ref.
+        self.repo.write(ALLOW, f"{MODULE}{MARKED}\n".encode())
+        self.repo.commit("main vouches for one module path")
+        git_out(self.repo.path, "checkout", "-q", "-b", "feature")
+        self.repo.write(ALLOW, f"{MODULE}{MARKED}\n{OTHER_MODULE}{MARKED}\n".encode())
+        self.repo.commit("push 1 vouches for another")
+        before = self.repo.head()
+        self.repo.write(
+            "app.py", f"import pkg.{MODULE}\nimport pkg.{OTHER_MODULE}\n".encode()
+        )
+        self.repo.commit("push 2 uses both")
+        code, out = self.scan("--base", before)
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"at {before[:12]}: 2 entries, 2 match(es) suppressed.", out)
+        code, out = self.scan("--base", before, "--allow-ref", "main")
+        self.assertEqual(code, 1, out)
+        self.assertEqual(FINDING_RE.findall(out), [("app.py", "mDNS/.local hostname")])
+        self.assertIn("::error file=app.py,line=2::", out)
+        main = git_out(self.repo.path, "rev-parse", "main")
+        self.assertIn(f"at {main[:12]} (main): 1 entry, 1 match(es) suppressed.", out)
+
+    def test_a_ref_that_names_no_commit_means_no_list(self):
+        self.repo.write(ALLOW, f"{MODULE}{MARKED}\n".encode())
+        self.repo.commit("vouch")
+        base = self.repo.head()
+        self.repo.write("app.py", f"import pkg.{MODULE}\n".encode())
+        self.repo.commit("use it")
+        # The base and HEAD both vouch for it. Neither stands in.
+        code, out = self.scan("--base", base, "--allow-ref", "origin/main")
+        self.assertEqual(code, 1, out)
+        missing = "from origin/main, which names no commit in this clone"
+        self.assertIn(
+            f"::notice::No allow file was read, since it comes {missing}.", out
+        )
+        self.assertIn(f": none {missing}, so nothing was suppressed.", out)
+
+    def test_an_allow_ref_git_could_read_two_ways_fails_the_scan(self):
+        # git reads a short origin/main as a tag or a local branch of that
+        # name before the remote-tracking branch. The scan refuses the name
+        # rather than read whichever list git took, or read none.
+        self.repo.write(ALLOW, b"# main vouches for nothing\n")
+        self.repo.commit("main's list")
+        main = self.repo.head()
+        git_out(self.repo.path, "update-ref", "refs/remotes/origin/main", main)
+        git_out(self.repo.path, "checkout", "-q", "-b", "feature")
+        self.repo.write(ALLOW, f"{MODULE}{MARKED}\n".encode())
+        self.repo.commit("push 1 vouches on the branch")
+        before = self.repo.head()
+        self.repo.write("app.py", f"import pkg.{MODULE}\n".encode())
+        self.repo.commit("push 2 uses it")
+        for kind, delete in [("tag", "-d"), ("branch", "-D")]:
+            with self.subTest(kind=kind):
+                git_out(self.repo.path, kind, "origin/main", "HEAD")
+                code, out = self.scan("--base", before, "--allow-ref", "origin/main")
+                self.assertEqual(code, 2, out)
+                self.assertIn(
+                    "::error::Redaction gate cannot tell which allow file to "
+                    "read. origin/main is ambiguous here.",
+                    out,
+                )
+                self.assertNotIn("::notice::", out)
+                self.assertNotIn("Allow file", out)
+                full = "refs/remotes/origin/main"
+                code, out = self.scan("--base", before, "--allow-ref", full)
+                self.assertEqual(code, 1, out)
+                self.assertIn(f"at {main[:12]} ({full}): 0 entries, 0 ", out)
+                git_out(self.repo.path, kind, delete, "origin/main")
+
+    def test_a_vouched_value_left_in_the_allow_file_s_history_is_reported(self):
+        # The net diff lets the value through in app.py. The commit that
+        # listed it a second time, bare, is still in history, and a match an
+        # allow file covers never stands in for one it doesn't.
+        self.repo.write(ALLOW, f"{MODULE}{MARKED}\n".encode())
+        self.repo.commit("vouch")
+        base = self.repo.head()
+        self.repo.write(ALLOW, f"{MODULE}{MARKED}\n{MODULE}\n".encode())
+        self.repo.write("app.py", f"import pkg.{MODULE}\n".encode())
+        self.repo.commit("use it, and list it again without a reason")
+        listed = self.repo.head()
+        self.repo.write(ALLOW, f"{MODULE}{MARKED}\n".encode())
+        self.repo.commit("drop the bare line")
+        code, out = self.scan("--base", base)
+        self.assertEqual(code, 1, out)
+        self.assertEqual(
+            COMMIT_FINDING_RE.findall(out),
+            [(ALLOW, "mDNS/.local hostname", listed[:12])],
+        )
+
+    def vouch_for_a_real_key(self) -> None:
+        self.repo.write(ALLOW, f"{AWS_KEY}\n".encode())
+        self.repo.write("deploy.sh", f"KEY={AWS_KEY}\n".encode())
+        self.repo.commit("vouch for a real key")
+
+    def test_all_files_scans_the_committed_list_not_a_local_edit(self):
+        # The list comes from HEAD, so its own lines are scanned from there.
+        self.vouch_for_a_real_key()
+        self.repo.write(ALLOW, b"# edited, not committed\n")
+        code, out = self.scan("--mode", "all-files")
+        self.assertEqual(FINDING_RE.findall(out), [(ALLOW, "AWS access key ID")])
+        self.assertEqual(code, 1)
+
+    def test_all_files_scans_the_committed_list_whatever_its_size(self):
+        pad = ("# " + "x" * 98 + "\n") * 21_000  # past MAX_FILE_BYTES
+        self.assertGreater(len(pad), rc.MAX_FILE_BYTES)
+        self.repo.write(ALLOW, f"{AWS_KEY}\n{pad}".encode())
+        self.repo.write("deploy.sh", f"KEY={AWS_KEY}\n".encode())
+        self.repo.commit("vouch for a real key, padded")
+        code, out = self.scan("--mode", "all-files")
+        self.assertEqual(FINDING_RE.findall(out), [(ALLOW, "AWS access key ID")])
+        self.assertEqual(code, 1)
+
+    def test_all_files_scans_the_committed_list_once_it_is_gone_from_disk(self):
+        self.vouch_for_a_real_key()
+        git_out(self.repo.path, "rm", "-q", ALLOW)
+        code, out = self.scan("--mode", "all-files")
+        self.assertEqual(FINDING_RE.findall(out), [(ALLOW, "AWS access key ID")])
+        self.assertEqual(code, 1)
+
+    def test_all_files_scans_the_allow_file_once_under_any_path_form(self):
+        # git reads HEAD:./.redaction-allow too. The walk must still know
+        # the working-tree copy is the same file, and leave it out.
+        self.vouch_for_a_real_key()
+        root = str(self.repo.path)
+        argv = ["--mode", "all-files", "--root", root, "--allow-file", "./" + ALLOW]
+        code, out, _err = run_main(argv)
+        self.assertEqual(FINDING_RE.findall(out), [(ALLOW, "AWS access key ID")])
+        self.assertEqual(code, 1)
+
+    def test_all_files_scans_an_edit_to_the_allow_file_not_yet_committed(self):
+        # The walk left the working-tree copy to the committed one, so a key
+        # added to the allow file and not committed went unreported, where
+        # the same key in any other file was reported.
+        self.repo.write(ALLOW, b"# vouches for nothing\n")
+        self.repo.commit("add the allow file")
+        self.repo.write(ALLOW, f"# vouches for nothing\n{AWS_KEY}\n".encode())
+        code, out = self.scan("--mode", "all-files")
+        self.assertEqual(FINDING_RE.findall(out), [(ALLOW, "AWS access key ID")])
+        self.assertIn(f"::error file={ALLOW},line=2::", out)
+        self.assertEqual(code, 1)
+        # Committed, then moved down a line in the working tree: reported
+        # once, where the working tree has it.
+        self.repo.commit("commit the key")
+        self.repo.write(ALLOW, f"# vouches for nothing\n\n{AWS_KEY}\n".encode())
+        code, out = self.scan("--mode", "all-files")
+        self.assertEqual(FINDING_RE.findall(out), [(ALLOW, "AWS access key ID")])
+        self.assertIn(f"::error file={ALLOW},line=3::", out)
+        self.assertEqual(code, 1)
+
+    def test_all_files_reads_the_allow_file_from_root(self):
+        # git read HEAD:<path> from the top of the repository, while the walk
+        # lists paths from --root. With --root sub the list came from the
+        # top-level file, and the walk skipped sub's own copy as that file.
+        self.repo.write(ALLOW, b"# the top-level list\n")
+        self.repo.write(f"sub/{ALLOW}", f"{AWS_KEY}\n".encode())
+        self.repo.commit("an allow file at the top and one in sub")
+        root = str(self.repo.path / "sub")
+        argv = ["--mode", "all-files", "--root", root, "--allow-file", ALLOW]
+        code, out, err = run_main(argv)
+        self.assertNotIn(AWS_KEY, out + err)
+        self.assertEqual(FINDING_RE.findall(out), [(ALLOW, "AWS access key ID")])
+        self.assertIn(f"Allow file {ALLOW} at HEAD: 1 entry, 0 match", out)
+        self.assertEqual(code, 1)
+
+    def test_stdin_knows_the_allow_file_by_its_path_in_the_diff(self):
+        # The branch's own copy handed over by mistake, under another name.
+        # Its own line is still reported, whatever the copy is called.
+        base = self.repo.head()
+        self.vouch_for_a_real_key()
+        diff = rc.get_diff_via_git(base, str(self.repo.path))
+        with tempfile.TemporaryDirectory() as tmp:
+            copy = Path(tmp) / "head-allow.txt"
+            copy.write_bytes((self.repo.path / ALLOW).read_bytes())
+            code, out, err = run_main(["--allow-file", str(copy)], stdin_text=diff)
+        self.assertEqual(FINDING_RE.findall(out), [(ALLOW, "AWS access key ID")])
+        self.assertEqual(code, 1)
+        self.assertNotIn(AWS_KEY, out + err)
+
+    def test_allow_path_names_the_allow_file_in_the_diff(self):
+        diff = one_file_diff(ALLOW, AWS_KEY) + one_file_diff("cfg/allow.txt", AWS_KEY)
+        with tempfile.TemporaryDirectory() as tmp:
+            copy = Path(tmp) / "copy.txt"
+            copy.write_text(f"{AWS_KEY}\n", encoding="utf-8")
+            for extra, own in [
+                ([], ALLOW),
+                (["--allow-path", "cfg/allow.txt"], "cfg/allow.txt"),
+            ]:
+                with self.subTest(extra=extra):
+                    argv = ["--allow-file", str(copy), *extra]
+                    code, out, _err = run_main(argv, stdin_text=diff)
+                    self.assertEqual(
+                        FINDING_RE.findall(out), [(own, "AWS access key ID")]
+                    )
+
+    def test_stdin_reads_no_allow_file_unless_one_is_named(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / ALLOW).write_text(f"{MODULE}\n", encoding="utf-8")
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                diff = one_file_diff("app.py", f"import pkg.{MODULE}")
+                code, out, _err = run_main([], stdin_text=diff)
+            finally:
+                os.chdir(cwd)
+        self.assertEqual(code, 1)
+        self.assertNotIn("Allow file", out)
+
+    def test_the_allow_options_are_refused_where_they_mean_nothing(self):
+        listed = ["--allow-file", ALLOW]
+        base = ["--base", "main", *listed]
+        for argv in [
+            ["--allow-file", "a\n::stop-commands::x"],
+            [*listed, "--allow-ref", "main"],
+            ["--base", "main", "--allow-ref", "main"],
+            ["--mode", "all-files", *base, "--allow-ref", "main"],
+            [*base, "--allow-ref=-x"],
+            [*base, "--allow-ref", "main\n::warning::x"],
+            ["--allow-path", ALLOW],
+            [*base, "--allow-path", ALLOW],
+            ["--mode", "all-files", *listed, "--allow-path", ALLOW],
+        ]:
+            with self.subTest(argv=argv):
+                git = mock.patch.object(rc, "_git", side_effect=AssertionError("git"))
+                with git, self.assertRaises(SystemExit) as ctx:
+                    run_main([*argv, "--diff-file", os.devnull])
+                self.assertEqual(ctx.exception.code, 2)
+
+
 class ActionDefinitionTests(unittest.TestCase):
     """These tests never run action.yml's shell step, so guard its key lines."""
 
@@ -2069,6 +2619,30 @@ class ActionDefinitionTests(unittest.TestCase):
         self.assertIsNotNone(declared)
         self.assertIn("default: 'false'", declared.group(0))
         self.assertTrue(any("--skip-scanner-files" in ln for ln in self.code))
+
+    def test_the_allow_file_is_read_by_default(self):
+        text = (THIS_DIR / "action.yml").read_text(encoding="utf-8")
+        declared = re.search(r"\n  allow-file:\n(?:    .*\n)+", text)
+        self.assertIsNotNone(declared)
+        self.assertIn("default: .redaction-allow", declared.group(0))
+        self.assertTrue(any('"--allow-file=$ALLOW_FILE"' in ln for ln in self.code))
+        self.assertTrue(
+            any('"--summary-file=$GITHUB_STEP_SUMMARY"' in ln for ln in self.code)
+        )
+
+    def test_a_push_elsewhere_reads_the_allow_file_from_the_default_branch(self):
+        # ActionStepTests set these variables by hand, so guard their source.
+        text = (THIS_DIR / "action.yml").read_text(encoding="utf-8")
+        for mapping in [
+            "EVENT_NAME: ${{ github.event_name }}",
+            "GIT_REF: ${{ github.ref }}",
+            "DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
+        ]:
+            self.assertIn(mapping, text)
+        # By its full name: a tag or a local branch called origin/main would
+        # win over a short one.
+        allow_ref = '"--allow-ref=refs/remotes/origin/$DEFAULT_BRANCH"'
+        self.assertTrue(any(allow_ref in ln for ln in self.code))
 
     def test_the_pull_request_head_reaches_the_scanner(self):
         self.assertTrue(
@@ -2172,11 +2746,36 @@ class ActionStepTests(unittest.TestCase):
         up.write("notes.txt", f"host {IP}\n".encode())
         up.commit("add a host")
         cls.url = up.path.as_uri()
+        # A second upstream whose main vouches for IP.
+        (cls.tmp / "vouched").mkdir()
+        vouched = ScratchRepo(str(cls.tmp / "vouched"))
+        vouched.write(ALLOW, f"{IP}{FIXTURE_OK}\n".encode())
+        vouched.commit("main vouches for one address")
+        cls.vouched_url = vouched.path.as_uri()
 
-    def clone(self) -> Path:
+    def clone(self, url: str = "") -> Path:
         runner = Path(tempfile.mkdtemp(dir=self.tmp))
-        git_out(self.tmp, "clone", "-q", self.url, str(runner))
+        git_out(self.tmp, "clone", "-q", url or self.url, str(runner))
         return runner
+
+    def branch_pushes(self, branch: str = "feature") -> tuple[Path, str]:
+        """Clone the vouched upstream and add two pushes to a branch: the
+        first vouches for OTHER_IP on the branch alone, the second uses both
+        addresses. Returns the clone and the first push's commit."""
+        runner = self.clone(self.vouched_url)
+        identity = ["-c", "user.email=test@example.com", "-c", "user.name=test"]
+        git_out(runner, "checkout", "-q", "-b", branch)
+        both = f"{IP}{FIXTURE_OK}\n{OTHER_IP}{FIXTURE_OK}\n"
+        (runner / ALLOW).write_text(both, encoding="utf-8")
+        git_out(runner, "add", ALLOW)
+        git_out(runner, *identity, "commit", "-qm", "push 1: vouch on the branch")
+        before = git_out(runner, "rev-parse", "HEAD")
+        (runner / "more.txt").write_text(
+            f"host {IP}\nhost {OTHER_IP}\n", encoding="utf-8"
+        )
+        git_out(runner, "add", "more.txt")
+        git_out(runner, *identity, "commit", "-qm", "push 2: use both")
+        return runner, before
 
     def run_step(self, cwd: Path, **env: str) -> tuple[int, str, dict[str, str]]:
         """Run the step in cwd. Returns its exit code, output and step outputs."""
@@ -2191,11 +2790,17 @@ class ActionStepTests(unittest.TestCase):
                 "FAIL_ON": "match",
                 "SCAN_MODE": "added-lines",
                 "PATTERNS_FILE": "",
+                "ALLOW_FILE": "",
                 "SKIP_SCANNER_FILES": "false",
                 "BASE_REF": "",
                 "PR_BASE_REF": "",
                 "PR_HEAD_SHA": "",
+                "EVENT_NAME": "",
+                "GIT_REF": "",
+                "DEFAULT_BRANCH": "",
                 "GITHUB_OUTPUT": outputs.as_posix(),
+                # Never the summary of the CI job running these tests.
+                "GITHUB_STEP_SUMMARY": outputs.with_name("step_summary").as_posix(),
                 "RUNNER_TEMP": self.tmp.as_posix(),
                 **env,
             },
@@ -2319,6 +2924,239 @@ class ActionStepTests(unittest.TestCase):
         code, out, outputs = self.run_step(self.clone(), BASE_REF=self.base, PYTHON="")
         self.assertEqual((code, outputs["exit-code"]), (2, "2"), out)
         self.assertIn("::error::The Set up Python step gave no python-path", out)
+
+    def test_the_allow_file_is_read_from_the_base_and_counted(self):
+        runner = self.clone()
+        identity = ["-c", "user.email=test@example.com", "-c", "user.name=test"]
+        (runner / ALLOW).write_text(f"{IP}\n", encoding="utf-8")
+        git_out(runner, "add", ALLOW)
+        git_out(runner, *identity, "commit", "-qm", "allow the host")
+        base = git_out(runner, "rev-parse", "HEAD")
+        (runner / "more.txt").write_text(f"host {IP}\n", encoding="utf-8")
+        git_out(runner, "add", "more.txt")
+        git_out(runner, *identity, "commit", "-qm", "use it again")
+        summary = Path(tempfile.mkdtemp(dir=self.tmp)) / "summary.md"
+        code, out, outputs = self.run_step(
+            runner,
+            BASE_REF=base,
+            ALLOW_FILE=ALLOW,
+            GITHUB_STEP_SUMMARY=summary.as_posix(),
+        )
+        self.assertEqual((code, outputs["exit-code"]), (0, "0"), out)
+        counted = "1 entry, 1 match(es) suppressed."
+        self.assertIn(counted, Path(outputs["report"]).read_text(encoding="utf-8"))
+        self.assertIn(counted, summary.read_text(encoding="utf-8"))
+        # An empty input turns the allow file off.
+        code, out, _outputs = self.run_step(runner, BASE_REF=base)
+        self.assertEqual(code, 1, out)
+
+    def test_a_push_reads_the_allow_file_the_default_branch_has(self):
+        runner, before = self.branch_pushes()
+        push = {"BASE_REF": before, "ALLOW_FILE": ALLOW, "EVENT_NAME": "push"}
+        # To another branch, before is the pusher's own last push, so the
+        # list comes from main's tip, which vouches for IP alone.
+        code, out, _outputs = self.run_step(
+            runner, GIT_REF="refs/heads/feature", DEFAULT_BRANCH="main", **push
+        )
+        self.assertEqual(code, 1, out)
+        self.assertEqual(
+            FINDING_RE.findall(out), [("more.txt", "private/link-local IP")]
+        )
+        self.assertIn("::error file=more.txt,line=2::", out)
+        main = "(refs/remotes/origin/main): 1 entry, 1 match(es) suppressed."
+        self.assertIn(main, out)
+        # To main itself, before is main's own history.
+        code, out, _outputs = self.run_step(
+            runner, GIT_REF="refs/heads/main", DEFAULT_BRANCH="main", **push
+        )
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"at {before[:12]}: 2 entries, 2 match(es) suppressed.", out)
+
+    def test_a_ref_named_origin_main_never_gives_the_push_its_own_list(self):
+        # A push to a branch named origin/main gets a local branch of that
+        # name from actions/checkout, and fetch-depth: 0 brings a tag of that
+        # name. The step read the list from origin/main, which git took for
+        # either one, the pushed head, whose own entries then counted.
+        for kind, branch in [("branch", "origin/main"), ("tag", "feature")]:
+            with self.subTest(kind=kind):
+                runner, before = self.branch_pushes(branch)
+                if kind == "tag":
+                    git_out(runner, "tag", "origin/main", "HEAD")
+                code, out, _outputs = self.run_step(
+                    runner,
+                    BASE_REF=before,
+                    ALLOW_FILE=ALLOW,
+                    EVENT_NAME="push",
+                    GIT_REF=f"refs/heads/{branch}",
+                    DEFAULT_BRANCH="main",
+                )
+                self.assertEqual(code, 1, out)
+                self.assertEqual(
+                    FINDING_RE.findall(out), [("more.txt", "private/link-local IP")]
+                )
+                self.assertIn("::error file=more.txt,line=2::", out)
+                main = "(refs/remotes/origin/main): 1 entry, 1 match(es) suppressed."
+                self.assertIn(main, out)
+
+    def test_a_ref_named_origin_main_leaves_a_push_diffed_against_main(self):
+        # The README's base-ref for a push to a branch other than main. git
+        # read the base origin/main as the pushed head, so the range was
+        # HEAD..HEAD and the whole push went unscanned.
+        for kind, branch in [("branch", "origin/main"), ("tag", "feature")]:
+            with self.subTest(kind=kind):
+                runner, _before = self.branch_pushes(branch)
+                if kind == "tag":
+                    git_out(runner, "tag", "origin/main", "HEAD")
+                code, out, _outputs = self.run_step(
+                    runner,
+                    BASE_REF="main",
+                    ALLOW_FILE=ALLOW,
+                    EVENT_NAME="push",
+                    GIT_REF=f"refs/heads/{branch}",
+                    DEFAULT_BRANCH="main",
+                )
+                self.assertEqual(code, 1, out)
+                self.assertEqual(
+                    FINDING_RE.findall(out), [("more.txt", "private/link-local IP")]
+                )
+                self.assertIn("::error file=more.txt,line=2::", out)
+                main = "(refs/remotes/origin/main): 1 entry, 1 match(es) suppressed."
+                self.assertIn(main, out)
+
+    def upstream_with_an_empty_list(self) -> tuple[ScratchRepo, str]:
+        """An upstream whose main has an allow file that vouches for nothing.
+        Returns it and main's tip."""
+        up = ScratchRepo(tempfile.mkdtemp(dir=self.tmp))
+        up.write(ALLOW, b"# nothing vouched for on main\n")
+        up.commit("main: an empty list")
+        return up, up.head()
+
+    def tag_origin_main_vouching_for_ip(self, up: ScratchRepo, at: str) -> None:
+        """Tag a child of at, on no branch, whose allow file vouches for IP."""
+        git_out(up.path, "checkout", "-q", "--detach", at)
+        up.write(ALLOW, f"{IP}{FIXTURE_OK}\n".encode())
+        up.commit("vouch, on a tag only")
+        git_out(up.path, "tag", "origin/main", up.head())
+        git_out(up.path, "checkout", "-q", "main")
+
+    def feature_using_ip(self, up: ScratchRepo, at: str) -> str:
+        """Fork feature from at and use IP there. Returns its head."""
+        git_out(up.path, "checkout", "-q", "-b", "feature", at)
+        up.write("more.txt", f"host {IP}\n".encode())
+        up.commit("use it")
+        head = up.head()
+        git_out(up.path, "checkout", "-q", "main")
+        return head
+
+    def test_a_tag_named_origin_main_never_gives_a_head_checkout_its_list(self):
+        # pull_request_target, or pull_request with ref: head.sha. The list
+        # comes from the base as it is now, which git took to be the tag.
+        up, main_tip = self.upstream_with_an_empty_list()
+        self.tag_origin_main_vouching_for_ip(up, main_tip)
+        head = self.feature_using_ip(up, main_tip)
+        url = up.path.as_uri()
+        runner = checkout_like_actions(self.tmp, url, branch="feature")
+        code, out, _outputs = self.run_step(
+            runner,
+            BASE_REF="main",
+            PR_BASE_REF="main",
+            PR_HEAD_SHA=head,
+            ALLOW_FILE=ALLOW,
+            EVENT_NAME="pull_request_target",
+            GIT_REF="refs/heads/main",
+            DEFAULT_BRANCH="main",
+        )
+        self.assertEqual(code, 1, out)
+        self.assertEqual(
+            FINDING_RE.findall(out), [("more.txt", "private/link-local IP")]
+        )
+        self.assertIn(
+            f"at {main_tip[:12]} (refs/remotes/origin/main): 0 entries, 0 ", out
+        )
+
+    def test_a_tag_named_origin_main_off_an_older_main_never_gives_its_list(self):
+        # The default pull_request checkout. The tag doesn't hold main's tip,
+        # so the scan took it for a rewritten base, widened, and read the
+        # list from the tag.
+        up, old = self.upstream_with_an_empty_list()
+        up.write("later.txt", b"later\n")
+        up.commit("main moves on")
+        main_tip = up.head()
+        self.tag_origin_main_vouching_for_ip(up, old)
+        head = self.feature_using_ip(up, main_tip)
+        git_out(up.path, "checkout", "-q", "--detach", main_tip)
+        git_out(up.path, "merge", "-q", "--no-ff", "-m", "test merge", head)
+        merge = up.head()
+        git_out(up.path, "update-ref", "refs/pull/1/merge", merge)
+        git_out(up.path, "checkout", "-q", "main")
+        runner = checkout_like_actions(self.tmp, up.path.as_uri(), merge=merge)
+        code, out, _outputs = self.run_step(
+            runner,
+            BASE_REF="main",
+            PR_BASE_REF="main",
+            PR_HEAD_SHA=head,
+            ALLOW_FILE=ALLOW,
+            EVENT_NAME="pull_request",
+            GIT_REF="refs/pull/1/merge",
+            DEFAULT_BRANCH="main",
+        )
+        self.assertEqual(code, 1, out)
+        self.assertEqual(
+            FINDING_RE.findall(out), [("more.txt", "private/link-local IP")]
+        )
+        self.assertIn("test-merge commit against its first parent", out)
+        built_on = f"at {main_tip[:12]} (the commit the test merge was built on)"
+        self.assertIn(f"{built_on}: 0 entries, 0 ", out)
+
+    def test_a_shallow_single_branch_checkout_still_reads_the_default_branch(self):
+        # Two commits deep with no refspec for main, so origin/main exists
+        # only if the step fetches it into place itself.
+        upstream = Path(tempfile.mkdtemp(dir=self.tmp))
+        git_out(upstream, "init", "-q", "--bare")
+        runner, before = self.branch_pushes()
+        git_out(runner, "push", "-q", upstream.as_uri(), "main", "feature")
+        shallow = Path(tempfile.mkdtemp(dir=self.tmp))
+        git_out(
+            self.tmp,
+            "clone",
+            "-q",
+            "--depth=2",
+            "--single-branch",
+            "--branch=feature",
+            upstream.as_uri(),
+            str(shallow),
+        )
+        self.assertNotIn("origin/main", git_out(shallow, "branch", "-r"))
+        code, out, _outputs = self.run_step(
+            shallow,
+            BASE_REF=before,
+            ALLOW_FILE=ALLOW,
+            EVENT_NAME="push",
+            GIT_REF="refs/heads/feature",
+            DEFAULT_BRANCH="main",
+        )
+        self.assertEqual(code, 1, out)
+        self.assertEqual(
+            FINDING_RE.findall(out), [("more.txt", "private/link-local IP")]
+        )
+        main = "(refs/remotes/origin/main): 1 entry, 1 match(es) suppressed."
+        self.assertIn(main, out)
+
+    def test_a_default_branch_it_cannot_read_means_no_allow_file(self):
+        # Never before in its place, which vouches for both addresses.
+        runner, before = self.branch_pushes()
+        code, out, _outputs = self.run_step(
+            runner,
+            BASE_REF=before,
+            ALLOW_FILE=ALLOW,
+            EVENT_NAME="push",
+            GIT_REF="refs/heads/feature",
+            DEFAULT_BRANCH="trunk",
+        )
+        self.assertEqual(code, 1, out)
+        self.assertEqual(len(FINDING_RE.findall(out)), 2, out)
+        self.assertIn("::warning::Could not fetch the default branch", out)
+        self.assertIn("::notice::No allow file was read", out)
 
 
 @unittest.skipUnless(BASH, "needs bash, as a runner has")

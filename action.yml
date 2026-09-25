@@ -17,6 +17,23 @@ inputs:
       # are skipped.
     required: false
     default: ''
+  allow-file:
+    description: >-
+      Path (relative to the checkout) to an optional allow file, one exact
+      value per line, whose matches are counted instead of reported. Blank
+      lines and # comments are skipped. In added-lines mode it is read from
+      a commit the change can't edit, so an entry a pull request or push adds
+      lets nothing through until it has landed. When the checkout is GitHub's
+      test merge, the pull_request default, that is the commit the merge was
+      built on. Otherwise it is the base as it is now, the base branch's tip
+      or the commit a SHA base-ref names, except on a push to a branch other
+      than the default one, which reads the default branch's tip. It is never
+      the merge base. If that commit isn't in the clone, no allow file is
+      read and a notice says so. In all-files mode it is read as HEAD commits
+      it, and both that copy and the working-tree copy are scanned. It never
+      applies to the allow file itself. Set it to '' to turn it off.
+    required: false
+    default: .redaction-allow
   fail-on:
     description: >-
       'match' (default) fails the step when any finding is reported. 'none'
@@ -37,8 +54,11 @@ inputs:
       Branch to diff against in added-lines mode, or a full commit SHA.
       Defaults to the pull request's base branch (github.base_ref). Set
       this explicitly when triggering on an event other than pull_request.
-      On a push, pass github.event.before: a push to main with base-ref
-      main diffs main against itself and scans nothing. On a pull_request
+      On a push to the default branch, pass github.event.before: a push to
+      main with base-ref main diffs main against itself and scans nothing. On
+      a push to any other branch, pass the default branch
+      (github.event.repository.default_branch), which scans everything the
+      branch adds, the push that creates it included. On a pull_request
       event against that same base, the scan diffs GitHub's test-merge
       commit against its own first parent instead, so a base branch that
       moves while the check is queued cannot break it.
@@ -84,11 +104,15 @@ runs:
       env:
         PYTHON: ${{ steps.py.outputs.python-path }}
         PATTERNS_FILE: ${{ inputs.patterns-file }}
+        ALLOW_FILE: ${{ inputs.allow-file }}
         FAIL_ON: ${{ inputs.fail-on }}
         SCAN_MODE: ${{ inputs.scan-mode }}
         BASE_REF: ${{ inputs.base-ref || github.base_ref }}
         PR_BASE_REF: ${{ github.base_ref }}
         PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        EVENT_NAME: ${{ github.event_name }}
+        GIT_REF: ${{ github.ref }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         SKIP_SCANNER_FILES: ${{ inputs.skip-scanner-files }}
       run: |
         set -euo pipefail
@@ -108,6 +132,15 @@ runs:
         args=(--fail-on "$FAIL_ON")
         if [ -n "$PATTERNS_FILE" ]; then
           args+=(--patterns-file "$PATTERNS_FILE")
+        fi
+        # The scanner reads it from a commit, never from this checkout's files:
+        # the base in added-lines mode (see the push case below), HEAD in
+        # all-files mode.
+        if [ -n "$ALLOW_FILE" ]; then
+          args+=("--allow-file=$ALLOW_FILE")
+        fi
+        if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+          args+=("--summary-file=$GITHUB_STEP_SUMMARY")
         fi
         if [ "$SKIP_SCANNER_FILES" = "true" ]; then
           args+=(--skip-scanner-files)
@@ -154,6 +187,23 @@ runs:
             # end this line and start a workflow command of its own.
             ref=${BASE_REF//%/%25}; ref=${ref//$'\r'/%0D}; ref=${ref//$'\n'/%0A}
             echo "::warning::Could not fetch $ref from origin. Diffing against the checkout's own copy of it."
+          fi
+          # On a push to any branch but the default one, github.event.before
+          # is that branch's previous tip, which the pusher wrote, so an entry
+          # added in one push would count from the next without review. The
+          # allow file comes from the default branch's tip instead, fetched
+          # here in case the checkout is shallow, into origin/<name> by full
+          # refspec, since a single-branch clone maps no other branch there.
+          # It is passed by its full name too. git reads a short origin/<name>
+          # as a tag or a local branch of that name first, and a push to a
+          # branch called origin/main makes one, whose own list would count.
+          # If it still names no commit, the scanner reads no allow file and
+          # says so.
+          if [ -n "$ALLOW_FILE" ] && [ "$EVENT_NAME" = "push" ] && [ "$GIT_REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+            if [ -z "$DEFAULT_BRANCH" ] || ! git fetch --no-tags origin -- "+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"; then
+              echo "::warning::Could not fetch the default branch, which the allow file is read from on this push."
+            fi
+            args+=("--allow-ref=refs/remotes/origin/$DEFAULT_BRANCH")
           fi
           # On a pull_request event the checkout is GitHub's test-merge commit.
           # Given the head SHA, the scanner diffs that commit against its own

@@ -18,13 +18,19 @@ Exit 0 = clean (or findings under --fail-on none). Exit 1 = findings and
 --fail-on match (the default). Exit 2 = --base was given and the diff to
 scan could not be computed, which is never a pass, whatever --fail-on says.
 A genuine false positive: mark the specific line with a `redaction-ok`
-comment, or override on merge.
+comment, or override on merge. A value that recurs can go in an allow file
+(--allow-file), one exact literal per line. With --base it is read from the
+base as it is now, or from the commit a pull request's test merge was built
+on, never from the change or its merge base, so an entry the change itself
+adds lets nothing through. It never applies to a file with its own name.
 
 Usage:
     python redaction_check.py --diff-file changes.diff
     git diff --unified=0 origin/main...HEAD | python redaction_check.py
     python redaction_check.py --base origin/main
     python redaction_check.py --base origin/main --pr-head <sha>  # PR merge ref
+    python redaction_check.py --base origin/main --allow-file .redaction-allow
+    python redaction_check.py --base <sha> --allow-file .redaction-allow --allow-ref refs/remotes/origin/main
     python redaction_check.py --mode all-files --root .
     python redaction_check.py --selftest
 """
@@ -34,6 +40,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import hmac
+import posixpath
 import re
 import secrets
 import subprocess
@@ -268,6 +275,7 @@ class Finding:
     label: str
     masked: str
     commit: str = ""  # set when the line came from one commit's own patch
+    allowed: bool = False  # an allow-file entry covers it: counted, never reported
 
 
 # The mask key, random and fresh for each run, and never printed. An unsalted
@@ -349,6 +357,170 @@ def load_extra_patterns(path: str) -> list[tuple[str, re.Pattern[str]]]:
                 ) from exc
             patterns.append((f"custom pattern ({line[:40]})", rgx))
     return patterns
+
+
+# ---------------------------------------------------------------------------
+# Allow file -- exact values a repository vouches for
+# ---------------------------------------------------------------------------
+
+# A short entry matches too much by accident, and a long list is the gate being
+# switched off one value at a time.
+ALLOW_MIN_CHARS = 4
+ALLOW_MAX_ENTRIES = 200
+# A `#` that opens a line, or follows whitespace, starts a comment. An entry's
+# line can then carry a `redaction-ok` marker and the reason the value is safe.
+ALLOW_COMMENT_RE = re.compile(r"(?:^|\s)#")
+# Where the allow file sits in a repository unless a caller says otherwise. A
+# diff on stdin names its files by this kind of path, never by where a copy of
+# the allow file was saved on disk.
+DEFAULT_ALLOW_PATH = ".redaction-allow"
+
+
+@dataclass(frozen=True)
+class Allowlist:
+    """Exact values whose matches are counted instead of reported.
+
+    A match is covered only when the whole text a pattern matched equals an
+    entry, case and all. Every other match on the same line is still reported,
+    and so is a value that contains an entry or sits inside one. A file with
+    the allow file's name never gets the list. Its lines are scanned as if
+    there were none, so a real secret pasted into it is still reported. The
+    name is the one the allow file has in the repository, never the name of a
+    copy the list was read from.
+    """
+
+    entries: frozenset[str] = frozenset()
+    name: str = ""  # the allow file's basename in the repository
+    found: bool = False  # False when there was no file to read
+
+    def covers(self, path: str, matched: str) -> bool:
+        return matched in self.entries and path.rsplit("/", 1)[-1] != self.name
+
+
+def allow_text(data: bytes) -> str:
+    """Decode an allow file. PowerShell 5's `>` writes UTF-16 with a BOM."""
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16", "replace")
+    return data.decode("utf-8-sig", "replace")
+
+
+def parse_allowlist(text: str, where: str) -> tuple[frozenset[str], list[str]]:
+    """Return an allow file's entries, and a warning for each line it ignores.
+
+    A warning names the line, never its text, because the file may hold the
+    very value it should not.
+    """
+    entries: dict[str, None] = {}  # insertion-ordered, so the cap keeps the first
+    warnings: list[str] = []
+    over_cap: list[int] = []
+    for lineno, raw in enumerate(text.split("\n"), start=1):
+        literal = ALLOW_COMMENT_RE.split(raw, maxsplit=1)[0].strip()
+        if not literal:
+            continue
+        if len(literal) < ALLOW_MIN_CHARS:
+            reason = f"shorter than {ALLOW_MIN_CHARS} characters"
+        elif re.search(r"\s", literal):
+            reason = "it holds whitespace"
+        elif "\ufffd" in literal:
+            # Every byte that is not valid text decodes to U+FFFD, in the
+            # scanned lines as well, so an entry holding one would also match
+            # values with other bytes in its place.
+            reason = "it holds U+FFFD, which stands in for any byte that is not text"
+        else:
+            if literal not in entries:
+                if len(entries) < ALLOW_MAX_ENTRIES:
+                    entries[literal] = None
+                else:
+                    over_cap.append(lineno)
+            continue
+        warnings.append(f"{where}, line {lineno}: entry ignored, {reason}.")
+    if over_cap:
+        warnings.append(
+            f"{where}: {len(over_cap)} entries from line {over_cap[0]} on ignored, "
+            f"past the first {ALLOW_MAX_ENTRIES}."
+        )
+    return frozenset(entries), warnings
+
+
+def load_allowlist(
+    path: str, data: bytes | None, where: str, repo_path: str | None = None
+) -> Allowlist:
+    """Build the list from the allow file's bytes, printing each warning.
+
+    repo_path is the allow file's path in the repository, whose name the list
+    never applies to. It is path itself unless the list was read from a copy
+    on disk.
+    """
+    name = (repo_path or path).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    if data is None:
+        return Allowlist(name=name)
+    entries, warnings = parse_allowlist(allow_text(data), f"Allow file {path} {where}")
+    for warning in warnings:
+        print(f"::warning::{command_data(warning)}")
+    return Allowlist(entries, name, found=True)
+
+
+def allow_file_at(commit: str, path: str, root: str = ".") -> bytes | None:
+    """Return the allow file as commit has it, or None when it has none there.
+
+    Read from the commit, never the working tree, so the copy a change brings
+    with it has no say in what that change may add.
+    """
+    result = _git(root, "cat-file", "blob", f"{commit}:{path}")
+    return result.stdout if result.returncode == 0 else None
+
+
+def allow_source(
+    base: str,
+    from_commit: str,
+    to_commit: str,
+    root: str = ".",
+    pr_head: str | None = None,
+    allow_ref: str | None = None,
+) -> tuple[str | None, str]:
+    """Return the commit a --base scan reads the allow file from, and where
+    that is, in words for the log. The commit is None when the ref it should
+    come from names no commit in this clone, and then no list is read at all.
+
+    A pull request's test merge, scanned against its own first parent, reads
+    the commit that merge was built on. Any other range reads the base as it
+    is now. Never the merge base: a branch that forked before its base dropped
+    an entry would still find the entry there. allow_ref, when given, is read
+    in place of the base. The action passes the default branch that way on a
+    push to any other branch, whose base is the pusher's own previous push.
+    Raises DiffError when git could read the ref as more than one ref (see
+    resolve_ref), since the list would then come from whichever git took.
+    """
+    ref = allow_ref or base
+    if not allow_ref and pr_head:
+        if commit_parents(to_commit, root) == [from_commit, pr_head.strip().lower()]:
+            return (
+                from_commit,
+                f"at {from_commit[:12]} (the commit the test merge was built on)",
+            )
+    sha = resolve_ref(ref, root)
+    if sha is None:
+        return None, f"from {ref}, which names no commit in this clone"
+    if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", ref, re.IGNORECASE):
+        return sha, f"at {sha[:12]}"
+    return sha, f"at {sha[:12]} ({ref})"
+
+
+def allow_file_on_disk(path: str) -> bytes | None:
+    try:
+        return Path(path).read_bytes()
+    except OSError:
+        return None
+
+
+def allow_note(path: str, where: str, allow: Allowlist, suppressed: int) -> str:
+    """One line for the log and the job summary: where the list came from, and
+    how many matches it let through."""
+    if not allow.found:
+        return f"Allow file {path}: none {where}, so nothing was suppressed."
+    count = len(allow.entries)
+    entries = f"{count} entr{'y' if count == 1 else 'ies'}"
+    return f"Allow file {path} {where}: {entries}, {suppressed} match(es) suppressed."
 
 
 # ---------------------------------------------------------------------------
@@ -949,6 +1121,7 @@ def scan_commits(
     root: str = ".",
     extra_patterns: Iterable[tuple[str, re.Pattern[str]]] = (),
     skip_paths: Collection[str] = frozenset(),
+    allow: Allowlist | None = None,
 ) -> tuple[list[Finding], int]:
     """Scan each commit in from..to on its own, oldest first.
 
@@ -956,7 +1129,8 @@ def scan_commits(
     diff, but the commit that added it stays in the branch's history, which
     is public once pushed, and a merge commit or a rebase merge carries it
     onto the base branch. Returns the findings, each naming its commit, and
-    the number of commits in the range.
+    the number of commits in the range. Every commit gets the same allow
+    list, the base's, so an entry one commit adds covers nothing in the next.
     """
     commits = require_visible_commits(from_commit, to_commit, root)
     patches = git_commit_patches(from_commit, to_commit, root)
@@ -970,7 +1144,9 @@ def scan_commits(
     for sha, patch in patches:
         paths = added.get(sha, ())
         media = media_at(sha, root)
-        for f in scan_added_lines(patch, extra_patterns, paths, skip_paths, media):
+        for f in scan_added_lines(
+            patch, extra_patterns, paths, skip_paths, media, allow
+        ):
             findings.append(replace(f, commit=sha))
     return findings, len(commits)
 
@@ -981,12 +1157,14 @@ def merge_findings(net: list[Finding], history: list[Finding]) -> list[Finding]:
     A value the net diff reports is still in the change, and that finding
     already blocks it. Any other value is reported once, at the earliest
     commit that added it, since that commit is what keeps it in history.
+    Matches an allow file covers are merged the same way, but apart from the
+    rest, so a value let through in one place is still reported in another.
     """
-    reported = {(f.label, f.masked) for f in net}
-    first_commit: dict[tuple[str, str], str] = {}
+    reported = {(f.label, f.masked, f.allowed) for f in net}
+    first_commit: dict[tuple[str, str, bool], str] = {}
     merged = list(net)
     for f in history:
-        key = (f.label, f.masked)
+        key = (f.label, f.masked, f.allowed)
         if key in reported:
             continue
         if first_commit.setdefault(key, f.commit) == f.commit:
@@ -1023,6 +1201,7 @@ def scan_added_lines(
     added_paths: Iterable[str] = (),
     skip_paths: Collection[str] = frozenset(),
     is_media_file: Callable[[str], bool] | None = None,
+    allow: Allowlist | None = None,
 ) -> list[Finding]:
     """Scan a diff's added lines, and the name of each file it adds to.
 
@@ -1032,6 +1211,8 @@ def scan_added_lines(
     skip_paths are not scanned at all. is_media_file (see media_at) says
     which paths are real binary media, whose lines are skipped. Without it
     every line is scanned, since a diff does not show a file's leading bytes.
+    A match that allow covers comes back marked allowed, to be counted and
+    never reported. A secret filename is never covered.
     """
     findings: list[Finding] = []
     seen_paths: set[str] = set()
@@ -1049,7 +1230,10 @@ def scan_added_lines(
         if path in media_paths:
             continue
         for hit_label, matched in scan_line(text, extra_patterns):
-            findings.append(Finding(path, lineno, hit_label, mask(matched)))
+            allowed = allow is not None and allow.covers(path, matched)
+            findings.append(
+                Finding(path, lineno, hit_label, mask(matched), allowed=allowed)
+            )
     for path in added_paths:
         if path in skip_paths or path in seen_paths:
             continue
@@ -1060,11 +1244,45 @@ def scan_added_lines(
     return findings
 
 
+def scan_file_content(
+    path: str,
+    data: bytes,
+    extra_patterns: Iterable[tuple[str, re.Pattern[str]]] = (),
+    allow: Allowlist | None = None,
+) -> list[Finding]:
+    """Scan every line of one file's bytes.
+
+    Decoded with replacement, like git's output. A strict decode skipped the
+    whole file at its first byte that was not UTF-8, secrets and all. Lines
+    split on "\\n" only, as git numbers them.
+    """
+    findings: list[Finding] = []
+    for lineno, text in enumerate(_text(data).split("\n"), start=1):
+        for hit_label, matched in scan_line(text, extra_patterns):
+            allowed = allow is not None and allow.covers(path, matched)
+            findings.append(
+                Finding(path, lineno, hit_label, mask(matched), allowed=allowed)
+            )
+    return findings
+
+
 def scan_all_files(
     root: str = ".",
     extra_patterns: Iterable[tuple[str, re.Pattern[str]]] = (),
     skip_paths: Collection[str] = frozenset(),
+    allow: Allowlist | None = None,
+    pinned: tuple[str, bytes] | None = None,
 ) -> list[Finding]:
+    """Scan every tracked file: its name, and its content in the working tree.
+
+    pinned is (path, data): the allow file, and the bytes HEAD holds for it,
+    the ones its list was read from. Its working-tree copy is walked like any
+    other file, and those committed bytes are scanned as well, whatever their
+    size or format, and even when the file is gone from the working tree. A
+    value the list lets through elsewhere is then always reported where the
+    list itself holds it, and so is a value in an edit not yet committed. A
+    value both copies hold is reported once, where the working tree has it.
+    """
     findings: list[Finding] = []
     root_path = Path(root)
     for rel_path in iter_tracked_files(root):
@@ -1082,12 +1300,16 @@ def scan_all_files(
             continue  # unreadable; the filename check above still ran
         if is_media(rel_path, data[:MEDIA_HEAD_BYTES]):
             continue  # real binary media, whose content is skipped in both modes
-        # Decoded with replacement, like git's output. A strict decode skipped
-        # the whole file at its first byte that was not UTF-8, secrets and
-        # all. Lines split on "\n" only, as git numbers them.
-        for lineno, text in enumerate(_text(data).split("\n"), start=1):
-            for hit_label, matched in scan_line(text, extra_patterns):
-                findings.append(Finding(rel_path, lineno, hit_label, mask(matched)))
+        findings += scan_file_content(rel_path, data, extra_patterns, allow)
+    if pinned:
+        path, data = pinned
+        committed: list[Finding] = []
+        label = check_filename(path)
+        if label:
+            committed.append(Finding(path, 1, label, mask(path)))
+        committed += scan_file_content(path, data, extra_patterns, allow)
+        walked = {(f.label, f.masked) for f in findings if f.path == path}
+        findings += [f for f in committed if (f.label, f.masked) not in walked]
     return findings
 
 
@@ -1189,6 +1411,18 @@ def report(findings: list[Finding], fail_on: str) -> int:
     return 1 if (findings and fail_on == "match") else 0
 
 
+def write_summary(path: str, findings: int, note: str) -> None:
+    """Append the counts to a Markdown job summary, such as $GITHUB_STEP_SUMMARY."""
+    lines = ["### Redaction check", "", f"- Findings: {findings}"]
+    if note:
+        lines.append(f"- {note}")
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n\n")
+    except OSError as exc:
+        print(f"::warning::{command_data(f'Could not write the job summary: {exc}')}")
+
+
 def main(argv: list[str] | None = None) -> int:
     # A finding's path can hold any character, and a Windows runner's stdout
     # is cp1252. Escape what the stream cannot encode instead of crashing
@@ -1227,6 +1461,40 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--root", default=".", help="repo root for all-files mode / --base")
     ap.add_argument("--patterns-file", help="extra denylist file: one regex per line")
     ap.add_argument(
+        "--allow-file",
+        metavar="PATH",
+        help="allow file: exact values, one per line, whose matches are counted "
+        "instead of reported. With --base it is a path in the repo, read from the "
+        "base as it is now, or for a pull request's test merge from the commit "
+        "the merge was built on. In all-files mode it is a path from --root, read "
+        "as HEAD commits it, and both that copy and the working-tree copy are "
+        "scanned. With a diff on stdin or --diff-file it is read from disk as "
+        "given, so pass the base's copy",
+    )
+    ap.add_argument(
+        "--allow-ref",
+        metavar="REF",
+        help="with --base and --allow-file: read the allow file from REF instead "
+        "of the base. The action passes the default branch on a push to any "
+        "other branch, as refs/remotes/origin/<name>. If REF names no commit "
+        "here, no allow file is read. If it could be more than one ref, such "
+        "as origin/main beside a tag of that name, the scan exits 2",
+    )
+    ap.add_argument(
+        "--allow-path",
+        metavar="PATH",
+        help="with --allow-file and a diff on stdin or --diff-file: the allow "
+        f"file's path in the repository (default {DEFAULT_ALLOW_PATH}). The list "
+        "never applies to a file with that name in the diff, whatever the copy "
+        "on disk is called",
+    )
+    ap.add_argument(
+        "--summary-file",
+        metavar="PATH",
+        help="append a Markdown summary of the counts to this file "
+        "(the action passes $GITHUB_STEP_SUMMARY)",
+    )
+    ap.add_argument(
         "--fail-on",
         choices=["match", "none"],
         default="match",
@@ -1248,6 +1516,33 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     if args.pr_head and not args.base:
         ap.error("--pr-head needs --base, the fallback when HEAD is not a merge ref")
+    # The path is printed on lines of its own, where a line break would let it
+    # start a workflow command.
+    if args.allow_file and any(
+        ord(ch) < 32 or ord(ch) == 127 for ch in args.allow_file
+    ):
+        ap.error("--allow-file cannot hold a control character")
+    if args.allow_ref and not (
+        args.base and args.allow_file and args.mode == "added-lines"
+    ):
+        ap.error(
+            "--allow-ref needs --base and --allow-file, since it names the commit "
+            "a --base scan reads the allow file from"
+        )
+    # Printed as well, and read by git, which takes a leading "-" for an option.
+    if args.allow_ref and (
+        args.allow_ref.startswith("-")
+        or any(ord(ch) < 32 or ord(ch) == 127 for ch in args.allow_ref)
+    ):
+        ap.error("--allow-ref cannot start with '-' or hold a control character")
+    if args.allow_path and (
+        args.base or args.mode == "all-files" or not args.allow_file
+    ):
+        ap.error(
+            "--allow-path goes with --allow-file and a diff on stdin or in "
+            "--diff-file. With --base or in all-files mode, --allow-file is "
+            "already the path in the repository"
+        )
 
     if args.selftest:
         return run_selftest()
@@ -1256,9 +1551,23 @@ def main(argv: list[str] | None = None) -> int:
         load_extra_patterns(args.patterns_file) if args.patterns_file else []
     )
     skip_paths = SELF_PATHS if args.skip_scanner_files else frozenset()
+    allow: Allowlist | None = None
+    allow_where = ""
 
     if args.mode == "all-files":
-        findings = scan_all_files(args.root, extra_patterns, skip_paths)
+        pinned = None
+        if args.allow_file:
+            allow_where = "at HEAD"
+            # Its path from --root, as `git ls-files` prints it there, so the
+            # walk knows which file the committed copy is. git reads
+            # HEAD:<path> from the top of the repository, and HEAD:./<path>
+            # from the directory it runs in, which is --root.
+            path = posixpath.normpath(args.allow_file.replace("\\", "/"))
+            data = allow_file_at("HEAD", f"./{path}", args.root)
+            allow = load_allowlist(args.allow_file, data, allow_where)
+            if data is not None:
+                pinned = (path, data)
+        findings = scan_all_files(args.root, extra_patterns, skip_paths, allow, pinned)
     else:
         added_paths: list[str] = []
         history: list[Finding] = []
@@ -1268,11 +1577,38 @@ def main(argv: list[str] | None = None) -> int:
                 from_commit, to_commit, how = resolve_diff_range(
                     args.base, args.root, args.pr_head
                 )
+                if args.allow_file:
+                    try:
+                        source, allow_where = allow_source(
+                            args.base,
+                            from_commit,
+                            to_commit,
+                            args.root,
+                            args.pr_head,
+                            args.allow_ref,
+                        )
+                    except DiffError as exc:
+                        # Never a guess at the list, and never no list: exit 2.
+                        reason = f"Redaction gate cannot tell which allow file to read. {exc}"
+                        print(f"::error::{command_data(reason)}")
+                        return 2
+                    data = None
+                    if source:
+                        data = allow_file_at(source, args.allow_file, args.root)
+                    allow = load_allowlist(args.allow_file, data, allow_where)
+                    if source is None:
+                        # Never the branch's own copy in its place: no list.
+                        notice = (
+                            f"No allow file was read, since it comes {allow_where}. "
+                            "Every match is reported. Fetch that ref first, or "
+                            "check out with fetch-depth: 0."
+                        )
+                        print(f"::notice::{command_data(notice)}")
                 diff_text = git_diff(from_commit, to_commit, args.root)
                 added_paths = git_added_paths(from_commit, to_commit, args.root)
                 is_media_file = media_at(to_commit, args.root)
                 history, commit_count = scan_commits(
-                    from_commit, to_commit, args.root, extra_patterns, skip_paths
+                    from_commit, to_commit, args.root, extra_patterns, skip_paths, allow
                 )
             except DiffError as exc:
                 reason = f"Redaction gate cannot compute the diff to scan. {exc}"
@@ -1294,12 +1630,30 @@ def main(argv: list[str] | None = None) -> int:
         else:
             stdin_bytes = getattr(sys.stdin, "buffer", None)
             diff_text = _text(stdin_bytes.read()) if stdin_bytes else sys.stdin.read()
+        if args.allow_file and not args.base:
+            # No base to read it from. The caller hands over the base's copy.
+            # The diff names the allow file by its path in the repository,
+            # whatever that copy is called, so that path is what the list
+            # never applies to.
+            allow_where = "on disk"
+            data = allow_file_on_disk(args.allow_file)
+            repo_path = args.allow_path or DEFAULT_ALLOW_PATH
+            allow = load_allowlist(args.allow_file, data, allow_where, repo_path)
         net = scan_added_lines(
-            diff_text, extra_patterns, added_paths, skip_paths, is_media_file
+            diff_text, extra_patterns, added_paths, skip_paths, is_media_file, allow
         )
         findings = merge_findings(net, history)
 
-    return report(findings, args.fail_on)
+    suppressed = sum(f.allowed for f in findings)
+    findings = [f for f in findings if not f.allowed]
+    note = ""
+    if allow is not None:
+        note = allow_note(args.allow_file, allow_where, allow, suppressed)
+        print(note)
+    code = report(findings, args.fail_on)
+    if args.summary_file:
+        write_summary(args.summary_file, len(findings), note)
+    return code
 
 
 if __name__ == "__main__":
