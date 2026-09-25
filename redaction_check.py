@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import hmac
+import posixpath
 import re
 import secrets
 import subprocess
@@ -1157,16 +1158,48 @@ def scan_added_lines(
     return findings
 
 
+def scan_file_content(
+    path: str,
+    data: bytes,
+    extra_patterns: Iterable[tuple[str, re.Pattern[str]]] = (),
+    allow: Allowlist | None = None,
+) -> list[Finding]:
+    """Scan every line of one file's bytes.
+
+    Decoded with replacement, like git's output. A strict decode skipped the
+    whole file at its first byte that was not UTF-8, secrets and all. Lines
+    split on "\\n" only, as git numbers them.
+    """
+    findings: list[Finding] = []
+    for lineno, text in enumerate(_text(data).split("\n"), start=1):
+        for hit_label, matched in scan_line(text, extra_patterns):
+            allowed = allow is not None and allow.covers(path, matched)
+            findings.append(
+                Finding(path, lineno, hit_label, mask(matched), allowed=allowed)
+            )
+    return findings
+
+
 def scan_all_files(
     root: str = ".",
     extra_patterns: Iterable[tuple[str, re.Pattern[str]]] = (),
     skip_paths: Collection[str] = frozenset(),
     allow: Allowlist | None = None,
+    pinned: tuple[str, bytes] | None = None,
 ) -> list[Finding]:
+    """Scan every tracked file: its name, and its content in the working tree.
+
+    pinned is (path, data): the allow file, and the bytes HEAD holds for it,
+    the ones its list was read from. Those bytes are scanned in place of the
+    working-tree copy, whatever their size or format, and even when the file
+    is gone from the working tree. A value the list lets through elsewhere is
+    then always reported where the list itself holds it.
+    """
     findings: list[Finding] = []
     root_path = Path(root)
+    pinned_path = pinned[0] if pinned else None
     for rel_path in iter_tracked_files(root):
-        if rel_path in skip_paths:
+        if rel_path in skip_paths or rel_path == pinned_path:
             continue
         label = check_filename(rel_path)
         if label:
@@ -1180,15 +1213,13 @@ def scan_all_files(
             continue  # unreadable; the filename check above still ran
         if is_media(rel_path, data[:MEDIA_HEAD_BYTES]):
             continue  # real binary media, whose content is skipped in both modes
-        # Decoded with replacement, like git's output. A strict decode skipped
-        # the whole file at its first byte that was not UTF-8, secrets and
-        # all. Lines split on "\n" only, as git numbers them.
-        for lineno, text in enumerate(_text(data).split("\n"), start=1):
-            for hit_label, matched in scan_line(text, extra_patterns):
-                allowed = allow is not None and allow.covers(rel_path, matched)
-                findings.append(
-                    Finding(rel_path, lineno, hit_label, mask(matched), allowed=allowed)
-                )
+        findings += scan_file_content(rel_path, data, extra_patterns, allow)
+    if pinned:
+        path, data = pinned
+        label = check_filename(path)
+        if label:
+            findings.append(Finding(path, 1, label, mask(path)))
+        findings += scan_file_content(path, data, extra_patterns, allow)
     return findings
 
 
@@ -1343,9 +1374,9 @@ def main(argv: list[str] | None = None) -> int:
         help="allow file: exact values, one per line, whose matches are counted "
         "instead of reported. With --base it is a path in the repo, read from the "
         "base as it is now, or for a pull request's test merge from the commit "
-        "the merge was built on. In all-files mode it is read as HEAD has it. "
-        "With a diff on stdin or --diff-file it is read from disk as given, so "
-        "pass the base's copy",
+        "the merge was built on. In all-files mode it is read as HEAD commits it, "
+        "and that copy is always scanned. With a diff on stdin or --diff-file it "
+        "is read from disk as given, so pass the base's copy",
     )
     ap.add_argument(
         "--allow-ref",
@@ -1413,11 +1444,16 @@ def main(argv: list[str] | None = None) -> int:
     allow_where = ""
 
     if args.mode == "all-files":
+        pinned = None
         if args.allow_file:
             allow_where = "at HEAD"
             data = allow_file_at("HEAD", args.allow_file, args.root)
             allow = load_allowlist(args.allow_file, data, allow_where)
-        findings = scan_all_files(args.root, extra_patterns, skip_paths, allow)
+            if data is not None:
+                # Its path as `git ls-files` prints it, so the walk knows to
+                # leave the working-tree copy to the committed one.
+                pinned = (posixpath.normpath(args.allow_file.replace("\\", "/")), data)
+        findings = scan_all_files(args.root, extra_patterns, skip_paths, allow, pinned)
     else:
         added_paths: list[str] = []
         history: list[Finding] = []

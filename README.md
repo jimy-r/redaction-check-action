@@ -155,7 +155,7 @@ In `added-lines` mode the list is read from a commit outside the change under sc
 
 If that commit isn't in the clone (a shallow checkout whose fetch of the default branch failed, say), the scan reads no allow file at all and a notice says so. It never falls back to the branch's own copy.
 
-In `all-files` mode there's no change under scan. The list is read as `HEAD` commits it, so an uncommitted edit doesn't count.
+In `all-files` mode there's no change under scan. The list is read as `HEAD` commits it, so an uncommitted edit doesn't count, and that committed copy is also the one scanned as the allow file itself, whatever its size.
 
 A diff on stdin or in `--diff-file`, when you run the script yourself, has no base to read from, so `--allow-file` is read from disk as given. Hand it the base's copy (`git show origin/main:.redaction-allow > base-allow/.redaction-allow`), never the branch's own.
 

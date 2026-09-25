@@ -2166,6 +2166,46 @@ class AllowFileModeTests(unittest.TestCase):
         )
         self.assertIn(f": none {missing}, so nothing was suppressed.", out)
 
+    def vouch_for_a_real_key(self) -> None:
+        self.repo.write(ALLOW, f"{AWS_KEY}\n".encode())
+        self.repo.write("deploy.sh", f"KEY={AWS_KEY}\n".encode())
+        self.repo.commit("vouch for a real key")
+
+    def test_all_files_scans_the_committed_list_not_a_local_edit(self):
+        # The list comes from HEAD, so its own lines are scanned from there.
+        self.vouch_for_a_real_key()
+        self.repo.write(ALLOW, b"# edited, not committed\n")
+        code, out = self.scan("--mode", "all-files")
+        self.assertEqual(FINDING_RE.findall(out), [(ALLOW, "AWS access key ID")])
+        self.assertEqual(code, 1)
+
+    def test_all_files_scans_the_committed_list_whatever_its_size(self):
+        pad = ("# " + "x" * 98 + "\n") * 21_000  # past MAX_FILE_BYTES
+        self.assertGreater(len(pad), rc.MAX_FILE_BYTES)
+        self.repo.write(ALLOW, f"{AWS_KEY}\n{pad}".encode())
+        self.repo.write("deploy.sh", f"KEY={AWS_KEY}\n".encode())
+        self.repo.commit("vouch for a real key, padded")
+        code, out = self.scan("--mode", "all-files")
+        self.assertEqual(FINDING_RE.findall(out), [(ALLOW, "AWS access key ID")])
+        self.assertEqual(code, 1)
+
+    def test_all_files_scans_the_committed_list_once_it_is_gone_from_disk(self):
+        self.vouch_for_a_real_key()
+        git_out(self.repo.path, "rm", "-q", ALLOW)
+        code, out = self.scan("--mode", "all-files")
+        self.assertEqual(FINDING_RE.findall(out), [(ALLOW, "AWS access key ID")])
+        self.assertEqual(code, 1)
+
+    def test_all_files_scans_the_allow_file_once_under_any_path_form(self):
+        # git reads HEAD:./.redaction-allow too. The walk must still know
+        # the working-tree copy is the same file, and leave it out.
+        self.vouch_for_a_real_key()
+        root = str(self.repo.path)
+        argv = ["--mode", "all-files", "--root", root, "--allow-file", "./" + ALLOW]
+        code, out, _err = run_main(argv)
+        self.assertEqual(FINDING_RE.findall(out), [(ALLOW, "AWS access key ID")])
+        self.assertEqual(code, 1)
+
     def test_the_allow_options_are_refused_where_they_mean_nothing(self):
         listed = ["--allow-file", ALLOW]
         base = ["--base", "main", *listed]
