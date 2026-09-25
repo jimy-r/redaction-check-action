@@ -23,15 +23,15 @@ inputs:
       value per line, whose matches are counted instead of reported. Blank
       lines and # comments are skipped. In added-lines mode it is read from
       a commit the change can't edit, so an entry a pull request or push adds
-      lets nothing through until it has landed. On a pull_request that is
-      the commit GitHub built the test merge on. Otherwise it is the base as
-      it is now, the base branch's tip or the commit a SHA base-ref names,
-      except on a push to a branch other than the default one, which reads
-      the default branch's tip. It is never the merge base. If that commit
-      isn't in the clone, no allow file is read and a notice says so. In
-      all-files mode it is read as HEAD commits it, and that copy is always
-      scanned. It never applies to the allow file itself. Set it to '' to
-      turn it off.
+      lets nothing through until it has landed. When the checkout is GitHub's
+      test merge, the pull_request default, that is the commit the merge was
+      built on. Otherwise it is the base as it is now, the base branch's tip
+      or the commit a SHA base-ref names, except on a push to a branch other
+      than the default one, which reads the default branch's tip. It is never
+      the merge base. If that commit isn't in the clone, no allow file is
+      read and a notice says so. In all-files mode it is read as HEAD commits
+      it, and that copy is always scanned. It never applies to the allow file
+      itself. Set it to '' to turn it off.
     required: false
     default: .redaction-allow
   fail-on:
