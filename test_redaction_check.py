@@ -1165,6 +1165,31 @@ def checkout_merge(tmp: Path, url: str, merge: str, depth: int | None = None) ->
     return str(runner)
 
 
+def checkout_like_actions(
+    tmp: Path, url: str, branch: str = "", merge: str = ""
+) -> Path:
+    """Clone as actions/checkout does with fetch-depth: 0.
+
+    Every branch lands in refs/remotes/origin/ and every tag in refs/tags/.
+    A push to branch is checked out with `checkout -B <branch>`, as
+    actions/checkout does, which makes a local branch of that name. Without
+    a branch, the test-merge commit merge is checked out detached.
+    """
+    runner = Path(tempfile.mkdtemp(dir=tmp))
+    git_out(runner, "init", "-q")
+    git_out(runner, "remote", "add", "origin", url)
+    refspecs = ["+refs/heads/*:refs/remotes/origin/*", "+refs/tags/*:refs/tags/*"]
+    if merge:
+        refspecs.append(f"+{merge}:refs/remotes/pull/1/merge")
+    git_out(runner, "fetch", "-q", "origin", *refspecs)
+    if branch:
+        start = f"refs/remotes/origin/{branch}"
+        git_out(runner, "checkout", "-q", "--force", "-B", branch, start)
+    else:
+        git_out(runner, "checkout", "-q", "--detach", "refs/remotes/pull/1/merge")
+    return runner
+
+
 class MovedBaseTests(unittest.TestCase):
     """A base branch that moves while the check is queued must not break the scan.
 
@@ -1456,6 +1481,154 @@ class RewrittenBaseTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("was rewritten", out)
         self.assertNotIn("clean", out)
+
+
+class ShadowedRefTests(unittest.TestCase):
+    """A tag or a local branch called origin/main must never stand in for main.
+
+    git reads a short name through a fixed list of places and takes the first
+    ref that exists, so refs/tags/origin/main and refs/heads/origin/main both
+    win over refs/remotes/origin/main, with only a warning. A pull request
+    branched from an older main adds a host in H, and GitHub builds its test
+    merge M on main's newer tip T1. With a tag named origin/main at H, the scan
+    took H for a rewritten base, widened to the merge base of H and M, which
+    is H itself, and left the pull request's own line out.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls._tmp.cleanup)
+        cls.tmp = Path(cls._tmp.name).resolve()
+        (cls.tmp / "upstream").mkdir()
+        up = ScratchRepo(str(cls.tmp / "upstream"))
+        cls.base = up.head()
+        up.write("later.txt", b"later\n")
+        up.commit("T1: main moves on")
+        cls.main_tip = up.head()
+        git_out(up.path, "checkout", "-q", "-b", "feature", cls.base)
+        up.write("more.txt", f"host {IP}\n".encode())
+        up.commit("H: add a host")
+        cls.pr_head = up.head()
+        git_out(up.path, "checkout", "-q", "--detach", cls.main_tip)
+        git_out(up.path, "merge", "-q", "--no-ff", "-m", "M", cls.pr_head)
+        cls.merge = up.head()
+        git_out(up.path, "update-ref", "refs/pull/1/merge", cls.merge)
+        git_out(up.path, "checkout", "-q", "main")
+        cls.url = up.path.as_uri()
+
+    def merge_checkout(self) -> str:
+        return str(checkout_like_actions(self.tmp, self.url, merge=self.merge))
+
+    def head_checkout(self) -> str:
+        return str(checkout_like_actions(self.tmp, self.url, branch="feature"))
+
+    def test_a_short_name_a_tag_or_a_local_branch_shadows_is_refused(self):
+        for kind, shadow in [("tag", "refs/tags"), ("branch", "refs/heads")]:
+            for checkout, pr_head in [
+                (self.merge_checkout, self.pr_head),
+                (self.head_checkout, None),
+            ]:
+                with self.subTest(kind=kind, checkout=checkout.__name__):
+                    runner = checkout()
+                    git_out(runner, kind, "origin/main", self.pr_head)
+                    with self.assertRaises(rc.DiffError) as ctx:
+                        rc.resolve_diff_range("origin/main", runner, pr_head)
+                    message = str(ctx.exception)
+                    self.assertIn("origin/main is ambiguous here.", message)
+                    self.assertIn(
+                        f"It could name {shadow}/origin/main or "
+                        "refs/remotes/origin/main, and git would read "
+                        f"{shadow}/origin/main.",
+                        message,
+                    )
+
+    def test_the_full_name_reads_main_past_a_tag_and_a_branch_of_that_name(self):
+        runner = self.merge_checkout()
+        git_out(runner, "tag", "origin/main", self.pr_head)
+        git_out(runner, "branch", "origin/main", self.pr_head)
+        base = "refs/remotes/origin/main"
+        frm, to, how = rc.resolve_diff_range(base, runner, self.pr_head)
+        self.assertEqual((frm, to), (self.main_tip, self.merge))
+        self.assertIn("test-merge commit", how)
+        argv = ["--base", base, "--root", runner, "--pr-head", self.pr_head]
+        code, out, _err = run_main(argv)
+        self.assertEqual(code, 1, out)
+        self.assertEqual(
+            FINDING_RE.findall(out), [("more.txt", "private/link-local IP")]
+        )
+        # A checkout of the head itself, where the tag made the range empty.
+        runner = self.head_checkout()
+        git_out(runner, "tag", "origin/main", self.pr_head)
+        frm, to, _how = rc.resolve_diff_range(base, runner)
+        self.assertEqual((frm, to), (self.base, self.pr_head))
+
+    def test_the_cli_refuses_a_shadowed_base_and_never_passes(self):
+        runner = self.merge_checkout()
+        git_out(runner, "tag", "origin/main", self.pr_head)
+        for fail_on in ["match", "none"]:
+            with self.subTest(fail_on=fail_on):
+                argv = ["--base", "origin/main", "--root", runner, "--fail-on", fail_on]
+                code, out, _err = run_main([*argv, "--pr-head", self.pr_head])
+                self.assertEqual(code, 2, out)
+                self.assertIn("::error::", out)
+                self.assertIn("origin/main is ambiguous here.", out)
+                self.assertNotIn("Scanning", out)
+                self.assertNotIn("clean", out)
+
+    def test_an_expression_on_a_shadowed_name_is_refused(self):
+        runner = self.head_checkout()
+        git_out(runner, "branch", "origin/main", self.pr_head)
+        with self.assertRaises(rc.DiffError):
+            rc.resolve_diff_range("origin/main~0", runner)
+
+    def test_a_missing_full_name_is_not_read_as_a_branch_that_repeats_it(self):
+        # git reads refs/remotes/origin/main, when there is no such ref, as a
+        # branch of that name, which actions/checkout makes for a push to it.
+        runner = self.head_checkout()
+        git_out(runner, "update-ref", "-d", "refs/remotes/origin/main")
+        git_out(runner, "branch", "refs/remotes/origin/main", self.pr_head)
+        with self.assertRaises(rc.DiffError) as ctx:
+            rc.resolve_diff_range("refs/remotes/origin/main", runner)
+        self.assertIn(
+            "would read it as refs/heads/refs/remotes/origin/main", str(ctx.exception)
+        )
+
+    def test_an_existing_full_name_is_read_whatever_else_repeats_it(self):
+        # git reads a full name as itself first. Refusing it here would let
+        # anyone who can push a tag of that name fail every scan.
+        runner = self.head_checkout()
+        git_out(runner, "tag", "refs/remotes/origin/main", self.pr_head)
+        frm, to, _how = rc.resolve_diff_range("refs/remotes/origin/main", runner)
+        self.assertEqual((frm, to), (self.base, self.pr_head))
+
+    def test_a_full_sha_is_that_commit_whatever_refs_share_its_name(self):
+        runner = self.head_checkout()
+        git_out(runner, "tag", self.base, self.pr_head)
+        git_out(runner, "branch", self.base, self.pr_head)
+        frm, to, _how = rc.resolve_diff_range(self.base, runner)
+        self.assertEqual((frm, to), (self.base, self.pr_head))
+
+    def test_git_reads_a_short_name_in_the_order_the_scanner_checks(self):
+        # refs_named keeps its own copy of git's list. Pin it to the git that
+        # runs it: git's first choice is always the first ref it returns.
+        runner = self.head_checkout()
+        name = "pin/x"
+        refs = [rule.format(name) for rule in rc.REF_RULES[1:5]]
+        for ref in refs:
+            git_out(runner, "update-ref", ref, self.pr_head)
+        first = ["-c", "core.warnAmbiguousRefs=false", "rev-parse"]
+        while refs:
+            with self.subTest(refs=refs):
+                self.assertEqual(rc.refs_named(name, runner), refs)
+                picked = git_out(runner, *first, "--symbolic-full-name", name)
+                self.assertEqual(picked, refs[0])
+            git_out(runner, "update-ref", "-d", refs.pop(0))
+        # The last place, which cannot sit beside refs/remotes/pin/x.
+        last = rc.REF_RULES[5].format(name)
+        git_out(runner, "update-ref", last, self.pr_head)
+        self.assertEqual(rc.refs_named(name, runner), [last])
+        self.assertEqual(git_out(runner, *first, "--symbolic-full-name", name), last)
 
 
 # ---------------------------------------------------------------------------
@@ -2359,6 +2532,20 @@ class ActionDefinitionTests(unittest.TestCase):
         self.assertTrue(any("[0-9a-f]{40}" in ln for ln in self.code))
         self.assertTrue(any('--base "$base"' in ln for ln in self.code))
 
+    def test_a_branch_is_fetched_and_read_by_its_full_name(self):
+        # git reads a short origin/<name> as a tag or a local branch of that
+        # name first. ShadowedRefTests and ActionStepTests show what that did.
+        self.assertTrue(
+            any('base="refs/remotes/origin/$BASE_REF"' in ln for ln in self.code)
+        )
+        self.assertTrue(
+            any('refspec="+refs/heads/$BASE_REF:$base"' in ln for ln in self.code)
+        )
+        short = [
+            ln for ln in self.code if re.search(r"(?<!refs/remotes/)origin/\$", ln)
+        ]
+        self.assertEqual(short, [])
+
     def test_skipping_the_scanner_files_is_opt_in(self):
         text = (THIS_DIR / "action.yml").read_text(encoding="utf-8")
         declared = re.search(r"\n  skip-scanner-files:\n(?:    .*\n)+", text)
@@ -2436,7 +2623,7 @@ class BaseRefGuardTests(unittest.TestCase):
         fetch = next(i for i, ln in enumerate(code) if "git fetch" in ln)
         self.assertLess(guard, fetch)
         self.assertIn("exit 2", code[guard + 2])
-        self.assertIn('origin -- "$BASE_REF"', code[fetch])
+        self.assertIn('origin -- "$refspec"', code[fetch])
 
 
 def run_block(path: Path, step_name: str) -> str:
@@ -2568,6 +2755,89 @@ class ActionStepTests(unittest.TestCase):
         code, out, _outputs = self.run_step(runner, BASE_REF="main\n::warning::x")
         self.assertEqual(code, 2, out)
         self.assertNotIn("\n::warning::", "\n" + out)
+
+    def upstream_branch(self, branch: str) -> tuple[ScratchRepo, str]:
+        """An upstream whose branch adds a host that main doesn't have.
+        Returns the upstream, back on main, and the branch's head."""
+        up = ScratchRepo(tempfile.mkdtemp(dir=self.tmp))
+        git_out(up.path, "checkout", "-q", "-b", branch)
+        up.write("more.txt", f"host {IP}\n".encode())
+        up.commit("add a host")
+        head = up.head()
+        git_out(up.path, "checkout", "-q", "main")
+        return up, head
+
+    def assert_the_host_is_reported(self, code: int, out: str) -> None:
+        self.assertEqual(code, 1, out)
+        self.assertEqual(
+            FINDING_RE.findall(out), [("more.txt", "private/link-local IP")]
+        )
+
+    def test_a_push_to_a_branch_named_origin_main_is_diffed_against_main(self):
+        # actions/checkout runs `checkout -B origin/main` for this push. The
+        # step read its base origin/main as that local branch, so the range
+        # was HEAD..HEAD and nothing was scanned.
+        up, _head = self.upstream_branch("origin/main")
+        url = up.path.as_uri()
+        runner = checkout_like_actions(self.tmp, url, branch="origin/main")
+        code, out, _outputs = self.run_step(runner, BASE_REF="main")
+        self.assert_the_host_is_reported(code, out)
+
+    def test_a_tag_named_origin_main_at_the_head_leaves_the_push_in_range(self):
+        up, head = self.upstream_branch("feature")
+        git_out(up.path, "tag", "origin/main", head)
+        url = up.path.as_uri()
+        runner = checkout_like_actions(self.tmp, url, branch="feature")
+        code, out, _outputs = self.run_step(runner, BASE_REF="main")
+        self.assert_the_host_is_reported(code, out)
+
+    def test_a_tag_and_a_branch_named_origin_main_leave_the_pull_request_in(self):
+        # The pull request forked from an older main. A tag origin/main at its
+        # head passed for a rewritten base and narrowed the scan to main's own
+        # newer commits.
+        up, head = self.upstream_branch("feature")
+        up.write("later.txt", b"later\n")
+        up.commit("main moves on")
+        git_out(up.path, "tag", "origin/main", head)
+        git_out(up.path, "checkout", "-q", "--detach")
+        git_out(up.path, "merge", "-q", "--no-ff", "-m", "test merge", head)
+        merge = up.head()
+        git_out(up.path, "update-ref", "refs/pull/1/merge", merge)
+        git_out(up.path, "checkout", "-q", "main")
+        runner = checkout_like_actions(self.tmp, up.path.as_uri(), merge=merge)
+        git_out(runner, "branch", "origin/main", head)
+        pull_request = {"BASE_REF": "main", "PR_BASE_REF": "main"}
+        code, out, _outputs = self.run_step(runner, PR_HEAD_SHA=head, **pull_request)
+        self.assert_the_host_is_reported(code, out)
+        self.assertIn("test-merge commit against its first parent", out)
+
+    def test_a_tag_named_like_the_base_branch_does_not_stop_its_fetch(self):
+        # A fetch of the short name main took origin's tag main and left the
+        # checkout's origin/main as it was. Here main is rewritten after the
+        # checkout to purge a host the branch still carries, which only the
+        # rewritten main puts back in range.
+        up = ScratchRepo(tempfile.mkdtemp(dir=self.tmp))
+        root = up.head()
+        up.write("leak.txt", f"nas {IP}\n".encode())
+        up.commit("a host lands on main")
+        git_out(up.path, "checkout", "-q", "-b", "feature")
+        up.write("f.txt", b"clean\n")
+        up.commit("clean work")
+        git_out(up.path, "checkout", "-q", "main")
+        git_out(up.path, "tag", "main", root)
+        url = up.path.as_uri()
+        runner = checkout_like_actions(self.tmp, url, branch="feature")
+        git_out(up.path, "reset", "-q", "--hard", root)
+        up.write("o.txt", b"other\n")
+        up.commit("main rewritten, the host purged")
+        code, out, _outputs = self.run_step(runner, BASE_REF="main")
+        self.assertEqual(code, 1, out)
+        self.assertEqual(
+            FINDING_RE.findall(out), [("leak.txt", "private/link-local IP")]
+        )
+        self.assertEqual(
+            git_out(runner, "rev-parse", "refs/remotes/origin/main"), up.head()
+        )
 
     def test_the_step_reports_its_exit_code_and_output(self):
         # ci.yml asserts on these. A step outcome alone could not tell a

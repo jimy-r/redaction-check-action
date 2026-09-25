@@ -5,9 +5,10 @@ Scans the ADDED lines of a pull request (or, in --mode all-files, every
 git-tracked file) for the *shapes* of private content: email addresses,
 absolute home paths, credential/token prefixes, private-IP/hostname shapes,
 and common secret-file names. With --base, both the range's net diff and
-each of its commits on its own are scanned. High-confidence patterns only --
-a noisy gate that false-positives on ordinary prose gets disabled, which is
-worse than no gate at all.
+each of its commits on its own are scanned, and a --base that git could read
+as more than one ref, such as origin/main beside a tag of that name, is
+refused. High-confidence patterns only -- a noisy gate that false-positives
+on ordinary prose gets disabled, which is worse than no gate at all.
 
 Every finding is reported with the matched text MASKED (a keyed hash, never
 the raw substring), so the gate's own output -- which lands in a CI log that
@@ -696,6 +697,73 @@ def _history_is_complete(rev: str, root: str) -> bool:
     return not any(commit_parents(sha, root) for sha in _text(roots.stdout).split())
 
 
+# git reads a ref name that isn't spelled out in full by trying these in turn
+# and taking the first ref that exists (gitrevisions(7)). A tag or a local
+# branch called origin/main therefore wins over refs/remotes/origin/main, and
+# git only warns. A push to a branch named origin/main gets that local branch
+# from actions/checkout, and fetch-depth: 0 brings every tag.
+REF_RULES = (
+    "{}",
+    "refs/{}",
+    "refs/tags/{}",
+    "refs/heads/{}",
+    "refs/remotes/{}",
+    "refs/remotes/{}/HEAD",
+)
+# Where a revision's ref name ends, as in origin/main~1 or main^{commit}.
+REF_NAME_END_RE = re.compile(r"[~^:]|@\{")
+
+
+def refs_named(name: str, root: str = ".") -> list[str]:
+    """Return each ref git could read name as, in the order git tries them.
+
+    Only the part before any ~, ^, : or @{ names a ref, so origin/main~1 is
+    checked as origin/main.
+    """
+    ref = REF_NAME_END_RE.split(name, maxsplit=1)[0]
+    if not ref:
+        return []
+    candidates = [rule.format(ref) for rule in REF_RULES]
+    listed = _git(root, "for-each-ref", "--format=%(refname)", *candidates)
+    if listed.returncode != 0:
+        raise DiffError(
+            f"Cannot list the refs {ref} could name: {_last_error_line(listed)}"
+        )
+    existing = set(_text(listed.stdout).split("\n"))
+    return [candidate for candidate in candidates if candidate in existing]
+
+
+def resolve_ref(name: str, root: str = ".") -> str | None:
+    """Return the commit name gives in this clone, or None when it gives none.
+
+    Raises DiffError rather than guess. A short name that more than one ref
+    answers to is refused, since git would read the first of them and only
+    warn. A full name such as refs/remotes/origin/main is always read as
+    itself when it exists. When it doesn't, git reads a ref it is the short
+    name of instead, such as a local branch of that name, and that is refused
+    too. A full commit SHA is always read as that commit.
+    """
+    resolved = _git(root, "rev-parse", "--verify", "--quiet", f"{name}^{{commit}}")
+    sha = _text(resolved.stdout).strip() if resolved.returncode == 0 else None
+    if sha and sha == name.lower():
+        return sha
+    ref = REF_NAME_END_RE.split(name, maxsplit=1)[0]
+    refs = refs_named(name, root)
+    if ref.startswith("refs/"):
+        if refs and refs[0] != ref:
+            raise DiffError(
+                f"{ref} is not a ref in this clone, and git would read it as "
+                f"{refs[0]} instead."
+            )
+    elif len(refs) > 1:
+        raise DiffError(
+            f"{ref} is ambiguous here. It could name {', '.join(refs[:-1])} or "
+            f"{refs[-1]}, and git would read {refs[0]}. Pass the full name of "
+            "the ref you mean."
+        )
+    return sha
+
+
 def _rewritten_base_range(
     base: str, first_parent: str, head_sha: str, root: str
 ) -> tuple[str, str, str] | None:
@@ -710,10 +778,9 @@ def _rewritten_base_range(
     `git diff base...HEAD` shows. Returns None to keep the first-parent range,
     including when base is missing, since that range never needs it.
     """
-    resolved = _git(root, "rev-parse", "--verify", f"{base}^{{commit}}")
-    if resolved.returncode != 0:
+    base_sha = resolve_ref(base, root)
+    if base_sha is None:
         return None
-    base_sha = _text(resolved.stdout).strip()
     contains = _git(root, "merge-base", "--is-ancestor", "--", first_parent, base_sha)
     if contains.returncode == 0:
         return None
@@ -753,7 +820,8 @@ def resolve_diff_range(
 
     Otherwise the range starts at the merge base of base and HEAD, which is
     what `git diff base...HEAD` shows. Raises DiffError, with the reason, when
-    the range cannot be computed.
+    the range cannot be computed, and when git could read base as more than
+    one ref (see resolve_ref).
     """
     # Before any git call: git reads a value that starts with "-" as an
     # option, and a control character could end a log line and start a
@@ -808,13 +876,12 @@ def resolve_diff_range(
             )
         how += f", since HEAD does not merge pull request head {pr_head[:12]}"
 
-    base_commit = _git(root, "rev-parse", "--verify", f"{base}^{{commit}}")
-    if base_commit.returncode != 0:
+    base_sha = resolve_ref(base, root)
+    if base_sha is None:
         raise DiffError(
             f"{base} does not name a commit in this clone. Check out with "
             "fetch-depth: 0 so the base branch's history is present."
         )
-    base_sha = _text(base_commit.stdout).strip()
     merge_base = _git(root, "merge-base", "--", base_sha, head_sha)
     if merge_base.returncode != 0:
         shallow = _git(root, "rev-parse", "--is-shallow-repository")
@@ -1375,7 +1442,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--base",
         help="if set, added-lines mode runs `git diff --unified=0 <base>...HEAD` itself "
-        "instead of reading --diff-file/stdin",
+        "instead of reading --diff-file/stdin. A name that could be more than "
+        "one ref, such as origin/main beside a tag of that name, is refused. "
+        "Pass the full name, such as refs/remotes/origin/main, instead",
     )
     ap.add_argument(
         "--pr-head",
