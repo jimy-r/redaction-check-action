@@ -157,7 +157,7 @@ The action names both branches in full, as `refs/remotes/origin/<name>`. git rea
 
 If that commit isn't in the clone (a shallow checkout whose fetch of the default branch failed, say), the scan reads no allow file at all and a notice says so. It never falls back to the branch's own copy.
 
-In `all-files` mode there's no change under scan. The list is read as `HEAD` commits it, so an uncommitted edit doesn't count, and that committed copy is also the one scanned as the allow file itself, whatever its size.
+In `all-files` mode there's no change under scan. The list is read as `HEAD` commits it, so an uncommitted edit doesn't count toward it. The allow file itself is scanned in both forms, the committed copy whatever its size and the copy in the working tree, so a value in an edit not yet committed is still reported. A value both copies hold is reported once.
 
 A diff on stdin or in `--diff-file`, when you run the script yourself, has no base to read from, so `--allow-file` is read from disk as given. Hand it the base's copy (`git show refs/remotes/origin/main:.redaction-allow > base-allow.txt`), never the branch's own. The allow file's own lines in the diff are known by their path there, `.redaction-allow` unless `--allow-path` names another, whatever the copy on disk is called.
 

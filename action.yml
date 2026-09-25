@@ -30,8 +30,8 @@ inputs:
       than the default one, which reads the default branch's tip. It is never
       the merge base. If that commit isn't in the clone, no allow file is
       read and a notice says so. In all-files mode it is read as HEAD commits
-      it, and that copy is always scanned. It never applies to the allow file
-      itself. Set it to '' to turn it off.
+      it, and both that copy and the working-tree copy are scanned. It never
+      applies to the allow file itself. Set it to '' to turn it off.
     required: false
     default: .redaction-allow
   fail-on:

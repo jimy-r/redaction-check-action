@@ -2481,6 +2481,41 @@ class AllowFileModeTests(unittest.TestCase):
         self.assertEqual(FINDING_RE.findall(out), [(ALLOW, "AWS access key ID")])
         self.assertEqual(code, 1)
 
+    def test_all_files_scans_an_edit_to_the_allow_file_not_yet_committed(self):
+        # The walk left the working-tree copy to the committed one, so a key
+        # added to the allow file and not committed went unreported, where
+        # the same key in any other file was reported.
+        self.repo.write(ALLOW, b"# vouches for nothing\n")
+        self.repo.commit("add the allow file")
+        self.repo.write(ALLOW, f"# vouches for nothing\n{AWS_KEY}\n".encode())
+        code, out = self.scan("--mode", "all-files")
+        self.assertEqual(FINDING_RE.findall(out), [(ALLOW, "AWS access key ID")])
+        self.assertIn(f"::error file={ALLOW},line=2::", out)
+        self.assertEqual(code, 1)
+        # Committed, then moved down a line in the working tree: reported
+        # once, where the working tree has it.
+        self.repo.commit("commit the key")
+        self.repo.write(ALLOW, f"# vouches for nothing\n\n{AWS_KEY}\n".encode())
+        code, out = self.scan("--mode", "all-files")
+        self.assertEqual(FINDING_RE.findall(out), [(ALLOW, "AWS access key ID")])
+        self.assertIn(f"::error file={ALLOW},line=3::", out)
+        self.assertEqual(code, 1)
+
+    def test_all_files_reads_the_allow_file_from_root(self):
+        # git read HEAD:<path> from the top of the repository, while the walk
+        # lists paths from --root. With --root sub the list came from the
+        # top-level file, and the walk skipped sub's own copy as that file.
+        self.repo.write(ALLOW, b"# the top-level list\n")
+        self.repo.write(f"sub/{ALLOW}", f"{AWS_KEY}\n".encode())
+        self.repo.commit("an allow file at the top and one in sub")
+        root = str(self.repo.path / "sub")
+        argv = ["--mode", "all-files", "--root", root, "--allow-file", ALLOW]
+        code, out, err = run_main(argv)
+        self.assertNotIn(AWS_KEY, out + err)
+        self.assertEqual(FINDING_RE.findall(out), [(ALLOW, "AWS access key ID")])
+        self.assertIn(f"Allow file {ALLOW} at HEAD: 1 entry, 0 match", out)
+        self.assertEqual(code, 1)
+
     def test_stdin_knows_the_allow_file_by_its_path_in_the_diff(self):
         # The branch's own copy handed over by mistake, under another name.
         # Its own line is still reported, whatever the copy is called.

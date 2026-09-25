@@ -1276,16 +1276,17 @@ def scan_all_files(
     """Scan every tracked file: its name, and its content in the working tree.
 
     pinned is (path, data): the allow file, and the bytes HEAD holds for it,
-    the ones its list was read from. Those bytes are scanned in place of the
-    working-tree copy, whatever their size or format, and even when the file
-    is gone from the working tree. A value the list lets through elsewhere is
-    then always reported where the list itself holds it.
+    the ones its list was read from. Its working-tree copy is walked like any
+    other file, and those committed bytes are scanned as well, whatever their
+    size or format, and even when the file is gone from the working tree. A
+    value the list lets through elsewhere is then always reported where the
+    list itself holds it, and so is a value in an edit not yet committed. A
+    value both copies hold is reported once, where the working tree has it.
     """
     findings: list[Finding] = []
     root_path = Path(root)
-    pinned_path = pinned[0] if pinned else None
     for rel_path in iter_tracked_files(root):
-        if rel_path in skip_paths or rel_path == pinned_path:
+        if rel_path in skip_paths:
             continue
         label = check_filename(rel_path)
         if label:
@@ -1302,10 +1303,13 @@ def scan_all_files(
         findings += scan_file_content(rel_path, data, extra_patterns, allow)
     if pinned:
         path, data = pinned
+        committed: list[Finding] = []
         label = check_filename(path)
         if label:
-            findings.append(Finding(path, 1, label, mask(path)))
-        findings += scan_file_content(path, data, extra_patterns, allow)
+            committed.append(Finding(path, 1, label, mask(path)))
+        committed += scan_file_content(path, data, extra_patterns, allow)
+        walked = {(f.label, f.masked) for f in findings if f.path == path}
+        findings += [f for f in committed if (f.label, f.masked) not in walked]
     return findings
 
 
@@ -1462,9 +1466,10 @@ def main(argv: list[str] | None = None) -> int:
         help="allow file: exact values, one per line, whose matches are counted "
         "instead of reported. With --base it is a path in the repo, read from the "
         "base as it is now, or for a pull request's test merge from the commit "
-        "the merge was built on. In all-files mode it is read as HEAD commits it, "
-        "and that copy is always scanned. With a diff on stdin or --diff-file it "
-        "is read from disk as given, so pass the base's copy",
+        "the merge was built on. In all-files mode it is a path from --root, read "
+        "as HEAD commits it, and both that copy and the working-tree copy are "
+        "scanned. With a diff on stdin or --diff-file it is read from disk as "
+        "given, so pass the base's copy",
     )
     ap.add_argument(
         "--allow-ref",
@@ -1553,12 +1558,15 @@ def main(argv: list[str] | None = None) -> int:
         pinned = None
         if args.allow_file:
             allow_where = "at HEAD"
-            data = allow_file_at("HEAD", args.allow_file, args.root)
+            # Its path from --root, as `git ls-files` prints it there, so the
+            # walk knows which file the committed copy is. git reads
+            # HEAD:<path> from the top of the repository, and HEAD:./<path>
+            # from the directory it runs in, which is --root.
+            path = posixpath.normpath(args.allow_file.replace("\\", "/"))
+            data = allow_file_at("HEAD", f"./{path}", args.root)
             allow = load_allowlist(args.allow_file, data, allow_where)
             if data is not None:
-                # Its path as `git ls-files` prints it, so the walk knows to
-                # leave the working-tree copy to the committed one.
-                pinned = (posixpath.normpath(args.allow_file.replace("\\", "/")), data)
+                pinned = (path, data)
         findings = scan_all_files(args.root, extra_patterns, skip_paths, allow, pinned)
     else:
         added_paths: list[str] = []
