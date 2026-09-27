@@ -891,8 +891,9 @@ class DiffParsingTests(unittest.TestCase):
                 self.assertEqual(code, 1)
 
     def test_a_hunk_shorter_than_its_header_hides_no_added_line(self):
-        # A header that counts more lines than follow takes the next file's
-        # lines for its own. Their added lines are still scanned.
+        # A header that counts more lines than follow can take the next file's
+        # lines for its own, in a plain diff with no `diff --git` line to end
+        # the hunk. Their added lines are still scanned.
         email = "jane" + "@acme-internal.com"
         first = "--- a/f.txt\n+++ b/f.txt\n@@ -1 +1,5 @@\n-a\n+b\n"
         second = f"--- a/g.txt\n+++ b/g.txt\n@@ -1 +1 @@\n-c\n+owner: {email}\n"
@@ -904,6 +905,122 @@ class DiffParsingTests(unittest.TestCase):
                 code, out, _err = run_main(["--diff-file", "-"], stdin_text=diff)
                 self.assertEqual(code, 1)
                 self.assertIn("Possible email address", out)
+
+    def test_a_header_line_ends_a_hunk_that_counted_too_many_lines(self):
+        # `git diff --word-diff=porcelain` prints an added blank line as a
+        # bare "~", which uses up no count, so its hunk headers can count more
+        # lines than follow. The count left over read the next file's
+        # `diff --git` and "+++ " lines as content. That file's name went
+        # unchecked, and under --skip-scanner-files its lines were skipped as
+        # the scanner's own. A `diff --git` or `@@` line now ends the hunk.
+        dotenv = "." + "env"
+        key = "sk-ant-" + "api03EXAMPLEKEY0000000"
+        email = "jane" + "@acme-internal.com"
+
+        def blank_line_added(name: str) -> str:
+            return (
+                f"diff --git a/{name} b/{name}\n"
+                "index 422c2b7..a1a53b5 100644\n"
+                f"--- a/{name}\n"
+                f"+++ b/{name}\n"
+                "@@ -1,2 +1,3 @@\n"
+                " a\n"
+                "~\n"
+                "~\n"
+                " b\n"
+                "~\n"
+            )
+
+        def new_file(name: str, text: str) -> str:
+            return (
+                f"diff --git a/{name} b/{name}\n"
+                "new file mode 100644\n"
+                "index 0000000..ab445cc\n"
+                "--- /dev/null\n"
+                f"+++ b/{name}\n"
+                "@@ -0,0 +1 @@\n"
+                f"+{text}\n"
+                "~\n"
+            )
+
+        cases = {
+            "an over-count, then a git file header": (
+                "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1,2 @@\n-a\n+b\n"
+                f"diff --git a/{dotenv} b/{dotenv}\n--- /dev/null\n+++ b/{dotenv}\n"
+                "@@ -0,0 +1 @@\n+A=1\n",
+                [],
+                [(dotenv, 1, "dotenv file")],
+            ),
+            "word-diff porcelain, then a dotenv file": (
+                blank_line_added("a.txt") + new_file(f"c/{dotenv}", "DEBUG=1"),
+                [],
+                [(f"c/{dotenv}", 1, "dotenv file")],
+            ),
+            "word-diff porcelain, then a dotenv file holding a key": (
+                blank_line_added("a.txt")
+                + new_file(f"c/{dotenv}", f"K={key}")
+                + new_file("zz0.txt", "filler"),
+                [],
+                [
+                    (f"c/{dotenv}", 1, "Anthropic API key"),
+                    (f"c/{dotenv}", 1, "dotenv file"),
+                ],
+            ),
+            "an over-count on the scanner's own file": (
+                "diff --git a/redaction_check.py b/redaction_check.py\n"
+                "--- a/redaction_check.py\n+++ b/redaction_check.py\n"
+                "@@ -1 +1,2 @@\n-a\n+b\n"
+                "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
+                f"@@ -1 +1 @@\n-c\n+k = '{key}'\n",
+                ["--skip-scanner-files"],
+                [("app.py", 1, "Anthropic API key")],
+            ),
+            "word-diff porcelain on the scanner's own file": (
+                blank_line_added("redaction_check.py")
+                + "diff --git a/src/app.py b/src/app.py\n"
+                "index 7d4290a..762f1fd 100644\n"
+                "--- a/src/app.py\n"
+                "+++ b/src/app.py\n"
+                "@@ -1 +1,2 @@\n"
+                " x = 1\n"
+                "~\n"
+                f"+k = '{key}'\n"
+                "~\n",
+                ["--skip-scanner-files"],
+                [("src/app.py", 2, "Anthropic API key")],
+            ),
+            "an over-count, then the file's next hunk": (
+                "--- a/f.txt\n+++ b/f.txt\n@@ -1 +1,3 @@\n-a\n+b\n"
+                f"@@ -20 +21 @@\n-x\n+owner: {email}\n"
+                f"--- /dev/null\n+++ b/{dotenv}\n@@ -0,0 +1 @@\n+A=1\n",
+                [],
+                [(dotenv, 1, "dotenv file"), ("f.txt", 21, "email address")],
+            ),
+        }
+        for name, (diff, flags, expected) in cases.items():
+            with self.subTest(name):
+                skip = rc.SELF_PATHS if flags else frozenset()
+                found = rc.scan_added_lines(diff, (), (), skip)
+                self.assertEqual(
+                    sorted((f.path, f.line, f.label) for f in found), expected
+                )
+                code, _out, _err = run_main(
+                    ["--diff-file", "-", *flags], stdin_text=diff
+                )
+                self.assertEqual(code, 1)
+
+    def test_a_plain_diff_count_ending_on_the_next_header_still_scans_it(self):
+        # With no `diff --git` line, a count that runs out on the next file's
+        # "+++ " line reads that ---/+++ pair as content. A hunk that really
+        # ends on "--- old" and "+++ new" looks the same (see above), so the
+        # next file's name goes unchecked. Every added line is still scanned.
+        dotenv = "." + "env"
+        diff = (
+            "--- a/f\n+++ b/f\n@@ -1 +1,2 @@\n-a\n+b\n"
+            f"--- /dev/null\n+++ b/{dotenv}\n@@ -0,0 +1 @@\n+A=1\n"
+        )
+        texts = [text for _, _, text in rc.parse_added_lines(diff)]
+        self.assertEqual(texts, ["b", f"++ b/{dotenv}", "A=1"])
 
     def test_combined_diff_hunks_run_to_the_next_header(self):
         # Git miscounts its own combined hunks. Near a file's end, git 2.53's

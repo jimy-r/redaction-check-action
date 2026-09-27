@@ -421,22 +421,27 @@ def parse_added_lines(diff_text: str) -> Iterator[tuple[str, int, str]]:
 
     A two-way hunk holds the lines its `@@ -a,b +c,d @@` header counts: b
     on the old side, d on the new, and one for an omitted count. Until both
-    counts are used up, every line is hunk content, whatever it looks like.
-    A removed "-- x" and an added "++ y" print as `--- x` and `+++ y`, a
-    file header's shape, and stay content. Only past the counts can a line
-    be a header, which is a `diff --git` line, the next `@@`, or a `---`
-    line with a `+++ ` line and a hunk header right under it. That last is
-    how a plain diff, which has no `diff --git` lines, opens its next file,
-    and how git's apply finds one. A "\\ No newline at end of file" line
-    takes up no count, and an empty line is empty context, also as git's
-    apply reads them.
+    counts are used up, every line is hunk content, whatever it looks like,
+    except a `diff --git` or `@@` line, which ends the hunk early. In git's
+    unified diff every line of a two-way hunk opens with " ", "+", "-" or
+    "\\", or is empty, so either of those lines inside the counts means the
+    header counted more lines than the hunk holds. `--word-diff=porcelain`
+    prints such hunks, since an added blank line prints only as "~" and
+    uses up no count. A removed "-- x" and an added "++ y" print as `--- x`
+    and `+++ y`, a file header's shape, and stay content. Past the counts,
+    a `---` line with a `+++ ` line and a hunk header right under it is a
+    header too. That is how a plain diff, which has no `diff --git` lines,
+    opens its next file, and how git's apply finds one. A
+    "\\ No newline at end of file" line takes up no count, and an empty
+    line is empty context, also as git's apply reads them.
 
     It fails closed. Past the counts, a `+` line that is not a header's
     `+++ ` is still yielded, so a hunk longer than its header says, or a
     hunk header that cannot be read, hides no added line. Where no file is
     named for the line, its path is "". A header that counts more lines
-    than its hunk holds reads the lines after it as its own, so their added
-    lines are yielded too, under its path.
+    than its hunk holds reads the lines after it as its own, up to the next
+    `diff --git` or `@@` line, so their added lines are yielded too, under
+    its path.
 
     In a merge commit's combined diff each line opens with one mark per
     parent. Only a line marked `+` against every parent, one that no parent
@@ -453,6 +458,10 @@ def parse_added_lines(diff_text: str) -> Iterator[tuple[str, int, str]]:
     in_header = True  # a plain unified diff opens with ---/+++, no diff --git
     lines = diff_text.split("\n")
     for i, line in enumerate(lines):
+        if (old_left or new_left) and (
+            DIFF_HEADER_RE.match(line) or line.startswith("@@")
+        ):
+            old_left = new_left = 0  # the header counted past its hunk's end
         if old_left or new_left:
             mark = line[:1]
             if mark == "+":
