@@ -360,6 +360,9 @@ def load_extra_patterns(path: str) -> list[tuple[str, re.Pattern[str]]]:
 # has parents (`@@@ -1 -1 +1,2 @@@` for two), and one old range per parent.
 DIFF_HEADER_RE = re.compile(r"^diff --(?:git|cc|combined) ")
 HUNK_RE = re.compile(r"^(@{2,}) (?:-\d+(?:,\d+)? )+\+(\d+)(?:,\d+)? \1(?:\s|$)")
+# A two-way hunk header's line counts, old side then new. An omitted count
+# is one line, so `@@ -5 +5 @@` holds one line on each side.
+TWO_WAY_HUNK_RE = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@(?:\s|$)")
 
 # Git's C-style escapes inside a quoted path. An octal escape is one byte.
 C_ESCAPE_RE = re.compile(r"\\(?:([0-7]{3})|(.))", re.DOTALL)
@@ -416,70 +419,104 @@ def parse_added_lines(diff_text: str) -> Iterator[tuple[str, int, str]]:
     line is part of its content, never a break that would strip the "+" from
     the text after it and hide that text from the scan.
 
-    `---` and `+++` are file headers only right after a `diff --git` line,
-    or -- since a plain diff has no such line to mark a new file -- right
-    after the previous file's last hunk, recognised there as a `---` line
-    immediately followed by a `+++ ` line. Inside a hunk, `+++ /dev/null`
-    is an added line whose text starts with "++ ", not a header that ends
-    the file; it never has its own `--- ` line directly above it, so the
-    pair check does not reclassify it.
+    A two-way hunk holds the lines its `@@ -a,b +c,d @@` header counts: b
+    on the old side, d on the new, and one for an omitted count. Until both
+    counts are used up, every line is hunk content, whatever it looks like.
+    A removed "-- x" and an added "++ y" print as `--- x` and `+++ y`, a
+    file header's shape, and stay content. Only past the counts can a line
+    be a header, which is a `diff --git` line, the next `@@`, or a `---`
+    line with a `+++ ` line and a hunk header right under it. That last is
+    how a plain diff, which has no `diff --git` lines, opens its next file,
+    and how git's apply finds one. A "\\ No newline at end of file" line
+    takes up no count, and an empty line is empty context, also as git's
+    apply reads them.
+
+    It fails closed. Past the counts, a `+` line that is not a header's
+    `+++ ` is still yielded, so a hunk longer than its header says, or a
+    hunk header that cannot be read, hides no added line. Where no file is
+    named for the line, its path is "". A header that counts more lines
+    than its hunk holds reads the lines after it as its own, so their added
+    lines are yielded too, under its path.
 
     In a merge commit's combined diff each line opens with one mark per
     parent. Only a line marked `+` against every parent, one that no parent
     had, is yielded. A line one parent already had came from that parent.
+    Git miscounts combined hunks (`git log --cc` has printed a count of
+    4294967295), so a combined hunk runs to the next `diff --cc` or `@@@`
+    line instead. A combined diff opens every file with `diff --cc`, so no
+    `---` and `+++ ` pair inside one is ever read as a header.
     """
     path: str | None = None
     lineno = 0
     parents = 1
+    old_left = new_left = 0  # the lines a two-way hunk still holds
     in_header = True  # a plain unified diff opens with ---/+++, no diff --git
     lines = diff_text.split("\n")
     for i, line in enumerate(lines):
+        if old_left or new_left:
+            mark = line[:1]
+            if mark == "+":
+                new_left = max(new_left - 1, 0)
+                yield path or "", lineno, line[1:]
+                lineno += 1
+            elif mark == "-":
+                old_left = max(old_left - 1, 0)
+            elif mark == " " or line in ("", "\r"):
+                old_left = max(old_left - 1, 0)
+                new_left = max(new_left - 1, 0)
+                lineno += 1
+            continue  # "\ No newline at end of file", or no hunk line at all
         if DIFF_HEADER_RE.match(line):
             path = None  # each file block starts clean; no cross-file bleed
-            in_header = True
-            continue
-        if (
-            not in_header
-            and line.startswith("--- ")
-            and i + 1 < len(lines)
-            and lines[i + 1].startswith("+++ ")
-        ):
-            # A plain diff has no `diff --git` line to re-arm in_header
-            # between files, so without this, the next file's own header
-            # (sitting right after the previous file's last hunk) is read
-            # as more hunk content under the previous file's stale path.
-            path = None
+            lineno = 0
             in_header = True
             continue
         if line.startswith("@@"):
             m = HUNK_RE.match(line)
             parents = len(m.group(1)) - 1 if m else 1
             lineno = int(m.group(2)) if m else 0
+            counts = TWO_WAY_HUNK_RE.match(line)
+            if counts:
+                old_left, new_left = (
+                    1 if n is None else int(n) for n in counts.groups()
+                )
             in_header = False
             continue
-        if in_header:
-            if line.startswith("+++ "):
-                # rstrip: a diff file saved with CRLF line endings.
-                new_path = unquote_header_path(line[4:].rstrip("\r"))
-                if new_path == "/dev/null":
-                    path = None
-                elif new_path.startswith("b/"):
-                    path = new_path[2:]
-                else:
-                    path = new_path
+        if parents > 1 and not in_header:
+            if line.startswith("\\"):
+                continue  # "\ No newline at end of file"
+            marks = line[:parents]
+            if len(marks) < parents or marks.strip("+- "):
+                continue  # not a hunk line
+            if "-" in marks:
+                continue  # a line only a parent has; new-file line counter untouched
+            if marks == "+" * parents:
+                yield path or "", lineno, line[parents:]
+            lineno += 1  # an added line, or context present; either is in the new file
             continue
-        if line.startswith("\\"):
-            continue  # "\ No newline at end of file"
-        if path is None:
+        if (
+            line.startswith("--- ")
+            and i + 2 < len(lines)
+            and lines[i + 1].startswith("+++ ")
+            and lines[i + 2].startswith("@@")
+        ):
+            path = None  # a plain diff's next file, with no diff --git line
+            lineno = 0
+            in_header = True
             continue
-        marks = line[:parents]
-        if len(marks) < parents or marks.strip("+- "):
-            continue  # not a hunk line
-        if "-" in marks:
-            continue  # a line only a parent has; new-file line counter untouched
-        if marks == "+" * parents:
-            yield path, lineno, line[parents:]
-        lineno += 1  # an added line, or context present; either is in the new file
+        if in_header and line.startswith("+++ "):
+            # rstrip: a diff file saved with CRLF line endings.
+            new_path = unquote_header_path(line[4:].rstrip("\r"))
+            if new_path == "/dev/null":
+                path = None
+            elif new_path.startswith("b/"):
+                path = new_path[2:]
+            else:
+                path = new_path
+            continue
+        if line.startswith("+"):
+            yield path or "", lineno, line[1:]  # past any hunk: scanned, not dropped
+            lineno += 1
 
 
 # Git's output is captured as bytes and decoded by _text, never by subprocess.

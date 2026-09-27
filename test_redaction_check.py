@@ -687,6 +687,269 @@ class DiffParsingTests(unittest.TestCase):
         got = [(path, lineno) for path, lineno, _ in rc.parse_added_lines(diff)]
         self.assertEqual(got, [(".env", 1)])
 
+    def test_header_shaped_lines_inside_a_hunk_are_content(self):
+        # Replacing "-- old comment" with "++ new comment" prints the pair as
+        # "--- old comment" and "+++ new comment", a file header's shape.
+        # Read as a header, it hid every added line after it in the hunk, in
+        # git's own output as well as in a plain diff.
+        email = "jane" + "@acme-internal.com"
+        header = "--- a/notes.sql\n+++ b/notes.sql\n"
+        hunk = (
+            "@@ -1,2 +1,3 @@\n"
+            " context\n"
+            "--- old comment\n"
+            "+++ new comment\n"
+            f"+owner: {email}\n"
+        )
+        git = "diff --git a/notes.sql b/notes.sql\nindex f6efa6f..9c7cf98 100644\n"
+        for name, diff in [("git", git + header + hunk), ("plain", header + hunk)]:
+            with self.subTest(format=name):
+                self.assertEqual(
+                    list(rc.parse_added_lines(diff)),
+                    [
+                        ("notes.sql", 2, "++ new comment"),
+                        ("notes.sql", 3, f"owner: {email}"),
+                    ],
+                )
+                code, out, _err = run_main(["--diff-file", "-"], stdin_text=diff)
+                self.assertEqual(code, 1)
+                self.assertIn("Possible email address", out)
+
+    def test_no_newline_markers_take_up_no_hunk_lines(self):
+        # "\ No newline at end of file" follows a side's last line, so it can
+        # sit inside a hunk (after the old side, here) or close one file's
+        # diff with more files after it. It is never a line of the hunk.
+        dotenv = "." + "env"
+        email = "jane" + "@acme-internal.com"
+        diff = (
+            "--- a/notes.sql\n"
+            "+++ b/notes.sql\n"
+            "@@ -1,2 +1,3 @@\n"
+            " context\n"
+            "--- old comment\n"
+            "\\ No newline at end of file\n"
+            "+++ new comment\n"
+            f"+owner: {email}\n"
+            "--- /dev/null\n"
+            f"+++ b/{dotenv}\n"
+            "@@ -0,0 +1 @@\n"
+            "+K=v\n"
+            "\\ No newline at end of file\n"
+            "--- a/tail.sql\n"
+            "+++ b/tail.sql\n"
+            "@@ -1 +1 @@\n"
+            "-a\n"
+            "\\ No newline at end of file\n"
+            "+b\n"
+            "\\ No newline at end of file\n"
+        )
+        self.assertEqual(
+            list(rc.parse_added_lines(diff)),
+            [
+                ("notes.sql", 2, "++ new comment"),
+                ("notes.sql", 3, f"owner: {email}"),
+                (dotenv, 1, "K=v"),
+                ("tail.sql", 1, "b"),
+            ],
+        )
+
+    def test_an_omitted_hunk_count_is_one_line(self):
+        # "@@ -2 +2 @@" holds one line on each side. Read as none, the hunk's
+        # own "--- old" and "+++ new", with the next hunk's header right under
+        # them, looked like a file header, and the owner line went to "new".
+        dotenv = "." + "env"
+        email = "jane" + "@acme-internal.com"
+        diff = (
+            "--- a/notes.sql\n"
+            "+++ b/notes.sql\n"
+            "@@ -2 +2 @@\n"
+            "--- old\n"
+            "+++ new\n"
+            "@@ -9 +9 @@\n"
+            "-x\n"
+            f"+owner: {email}\n"
+            "--- /dev/null\n"
+            f"+++ b/{dotenv}\n"
+            "@@ -0,0 +1 @@\n"
+            "+K=v\n"
+        )
+        self.assertEqual(
+            list(rc.parse_added_lines(diff)),
+            [
+                ("notes.sql", 2, "++ new"),
+                ("notes.sql", 9, f"owner: {email}"),
+                (dotenv, 1, "K=v"),
+            ],
+        )
+
+    def test_a_header_right_after_a_header_shaped_hunk_end_is_a_header(self):
+        # The hunk ends on "--- old" and "+++ owner ...", and the next file's
+        # header follows at once. Only the hunk's line counts tell the pair
+        # that is content from the pair that is a header.
+        dotenv = "." + "env"
+        email = "jane" + "@acme-internal.com"
+        first = (
+            "--- a/tail.sql\n"
+            "+++ b/tail.sql\n"
+            "@@ -1,2 +1,2 @@\n"
+            " context\n"
+            "--- old\n"
+            f"+++ owner {email}\n"
+        )
+        second = f"--- /dev/null\n+++ b/{dotenv}\n@@ -0,0 +1 @@\n+K=v\n"
+        git = (
+            "diff --git a/tail.sql b/tail.sql\n"
+            + first
+            + f"diff --git a/{dotenv} b/{dotenv}\nnew file mode 100644\n"
+            + second
+        )
+        for name, diff in [("git", git), ("plain", first + second)]:
+            with self.subTest(format=name):
+                self.assertEqual(
+                    list(rc.parse_added_lines(diff)),
+                    [("tail.sql", 2, f"++ owner {email}"), (dotenv, 1, "K=v")],
+                )
+                labels = sorted(f.label for f in rc.scan_added_lines(diff))
+                self.assertEqual(labels, ["dotenv file", "email address"])
+
+    def test_an_empty_line_in_a_hunk_is_empty_context(self):
+        # diff.suppressBlankEmpty, or an editor that trims trailing spaces,
+        # leaves an empty context line without its leading space. Git's apply
+        # reads it as a line on both sides, and the counts here do the same,
+        # in a diff saved with CRLF as well.
+        dotenv = "." + "env"
+        diff = (
+            "--- a/notes.sql\n"
+            "+++ b/notes.sql\n"
+            "@@ -1,3 +1,3 @@\n"
+            " one\n"
+            "\n"
+            "--- old\n"
+            "+++ new\n"
+            "--- /dev/null\n"
+            f"+++ b/{dotenv}\n"
+            "@@ -0,0 +1 @@\n"
+            "+K=v\n"
+        )
+        for eol in ["\n", "\r\n"]:
+            with self.subTest(eol=eol):
+                cr = eol[:-1]
+                self.assertEqual(
+                    list(rc.parse_added_lines(diff.replace("\n", eol))),
+                    [("notes.sql", 3, "++ new" + cr), (dotenv, 1, "K=v" + cr)],
+                )
+
+    def test_added_lines_beyond_a_hunks_counts_are_still_scanned(self):
+        # A hunk holding more lines than its header says, or a hunk header
+        # that cannot be read, hides nothing. Past the counts a "+" line is
+        # scanned, unless it is the "+++ " of a real ---/+++/@@ file header.
+        dotenv = "." + "env"
+        email = "jane" + "@acme-internal.com"
+        cases = {
+            "more lines than counted": (
+                "--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-a\n+b\n"
+                f"+owner: {email}\n"
+                f"--- /dev/null\n+++ b/{dotenv}\n@@ -0,0 +1 @@\n+K=v\n",
+                [
+                    ("f.txt", 1, "b"),
+                    ("f.txt", 2, f"owner: {email}"),
+                    (dotenv, 1, "K=v"),
+                ],
+            ),
+            "a header-shaped pair with no hunk under it": (
+                "--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-a\n+b\n"
+                f"--- old\n+++ new\n+owner: {email}\n",
+                [
+                    ("f.txt", 1, "b"),
+                    ("f.txt", 2, "++ new"),
+                    ("f.txt", 3, f"owner: {email}"),
+                ],
+            ),
+            "after a deleted file": (
+                "diff --git a/gone.txt b/gone.txt\n"
+                "deleted file mode 100644\n"
+                "--- a/gone.txt\n"
+                "+++ /dev/null\n"
+                "@@ -1 +0,0 @@\n"
+                "-bye\n"
+                f"+owner: {email}\n",
+                [("", 0, f"owner: {email}")],
+            ),
+            "under a hunk header that cannot be read": (
+                f"--- a/f.txt\n+++ b/f.txt\n@@ -one +two @@\n+owner: {email}\n",
+                [("f.txt", 0, f"owner: {email}")],
+            ),
+            "in a hunk with no file header": (
+                f"@@ -1 +1,2 @@\n-a\n+b\n+owner: {email}\n",
+                [("", 1, "b"), ("", 2, f"owner: {email}")],
+            ),
+        }
+        for name, (diff, expected) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(list(rc.parse_added_lines(diff)), expected)
+                code, _out, _err = run_main(["--diff-file", "-"], stdin_text=diff)
+                self.assertEqual(code, 1)
+
+    def test_a_hunk_shorter_than_its_header_hides_no_added_line(self):
+        # A header that counts more lines than follow takes the next file's
+        # lines for its own. Their added lines are still scanned.
+        email = "jane" + "@acme-internal.com"
+        first = "--- a/f.txt\n+++ b/f.txt\n@@ -1 +1,5 @@\n-a\n+b\n"
+        second = f"--- a/g.txt\n+++ b/g.txt\n@@ -1 +1 @@\n-c\n+owner: {email}\n"
+        git = "diff --git a/f.txt b/f.txt\n" + first + "diff --git a/g.txt b/g.txt\n"
+        for name, diff in [("git", git + second), ("plain", first + second)]:
+            with self.subTest(format=name):
+                texts = [text for _, _, text in rc.parse_added_lines(diff)]
+                self.assertIn(f"owner: {email}", texts)
+                code, out, _err = run_main(["--diff-file", "-"], stdin_text=diff)
+                self.assertEqual(code, 1)
+                self.assertIn("Possible email address", out)
+
+    def test_combined_diff_hunks_run_to_the_next_header(self):
+        # Git miscounts its own combined hunks. Near a file's end, git 2.53's
+        # `log --cc --unified=0` printed the f0.txt hunk header below: 4294967295
+        # for the second parent's count, and 0 for the result's over a hunk
+        # that holds a result line. Counted, that hunk swallows every file
+        # after it, and their lines, the next header's "+++" among them, read
+        # as f0.txt's. So a combined hunk runs to the next `diff --cc` or `@@@`
+        # line, and a header-shaped pair inside one is content.
+        dotenv = "z/." + "env"
+        email = "jane" + "@acme-internal.com"
+        diff = (
+            "diff --cc f0.txt\n"
+            "index e3f2255,4c3b19a..b7c613c\n"
+            "--- a/f0.txt\n"
+            "+++ b/f0.txt\n"
+            "@@@ -48,1 -49,4294967295 +49,0 @@@ line 36\n"
+            f" +host {IP}\n"
+            "- \n"
+            "diff --cc notes.sql\n"
+            "index a17f746,a17f746..3317352\n"
+            "--- a/notes.sql\n"
+            "+++ b/notes.sql\n"
+            "@@@ -2,1 -2,1 +2,2 @@@ contex\n"
+            "--- old comment\n"
+            "+++ new comment\n"
+            f"++owner: {email}\n"
+            f"diff --cc {dotenv}\n"
+            "index 0000000,0000000..51dfa66\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            f"+++ b/{dotenv}\n"
+            "@@@ -1,0 -1,0 +1,1 @@@\n"
+            "++K=v\n"
+        )
+        self.assertEqual(
+            list(rc.parse_added_lines(diff)),
+            [
+                ("notes.sql", 2, "+ new comment"),
+                ("notes.sql", 3, f"owner: {email}"),
+                (dotenv, 1, "K=v"),
+            ],
+        )
+        labels = sorted(f.label for f in rc.scan_added_lines(diff))
+        self.assertEqual(labels, ["dotenv file", "email address"])
+
 
 # ---------------------------------------------------------------------------
 # Extra patterns file
@@ -1938,6 +2201,20 @@ class GitDiffTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(found, [("pp.txt", "private/link-local IP")])
 
+    def test_header_shaped_lines_in_a_change_are_scanned(self):
+        # Replacing "-- old comment" with "++ new comment" makes git print
+        # "--- old comment" above "+++ new comment" inside the hunk.
+        email = "jane" + "@acme-internal.com"
+        self.repo.write("notes.sql", b"context\n-- old comment\n")
+        self.repo.commit("notes")
+        self.repo.write(
+            "notes.sql", f"context\n++ new comment\nowner: {email}\n".encode()
+        )
+        self.repo.commit("change")
+        code, found = self.repo.scan()
+        self.assertEqual(code, 1)
+        self.assertEqual(found, [("notes.sql", "email address")])
+
 
 # ---------------------------------------------------------------------------
 # Each commit, not just the net diff
@@ -2078,6 +2355,38 @@ class CommitHistoryTests(unittest.TestCase):
         self.assertEqual(
             COMMIT_FINDING_RE.findall(out),
             [("evil.txt", "private/link-local IP", merge[:12])],
+        )
+        self.assertEqual(len(FINDING_RE.findall(out)), 1)
+
+    def test_header_shaped_lines_in_a_merge_are_scanned(self):
+        # The merge replaces "- old comment", which both parents have, with
+        # "+ new comment" and slips in an owner line that a later commit takes
+        # out. With one mark per parent, the merge's combined diff prints the
+        # first two as "--- old comment" and "+++ new comment".
+        email = "jane" + "@acme-internal.com"
+        path = self.repo.path
+        self.repo.write("notes.sql", b"context\n- old comment\n")
+        self.repo.commit("notes")
+        base = self.repo.head()
+        git_out(path, "checkout", "-q", "-b", "side")
+        self.repo.write("side.txt", b"side\n")
+        self.repo.commit("side")
+        git_out(path, "checkout", "-q", "main")
+        self.repo.write("main.txt", b"main\n")
+        self.repo.commit("main")
+        git_out(path, "merge", "-q", "--no-ff", "--no-commit", "side")
+        self.repo.write(
+            "notes.sql", f"context\n+ new comment\nowner: {email}\n".encode()
+        )
+        self.repo.commit("merge side")
+        merge = self.repo.head()
+        self.repo.write("notes.sql", b"context\n+ new comment\n")
+        self.repo.commit("drop the owner line")
+        code, out = self.repo.run_cli(base)
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            COMMIT_FINDING_RE.findall(out),
+            [("notes.sql", "email address", merge[:12])],
         )
         self.assertEqual(len(FINDING_RE.findall(out)), 1)
 
