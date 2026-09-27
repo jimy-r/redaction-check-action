@@ -755,6 +755,66 @@ class ScanAddedLinesTests(unittest.TestCase):
         filename_hits = [f for f in findings if f.label == "dotenv file"]
         self.assertEqual(len(filename_hits), 1)
 
+    def test_plain_multi_file_diff_flags_a_dotenv_added_second(self):
+        # A plain unified diff (`--- a/x` / `+++ b/x`, no `diff --git` line)
+        # has nothing to re-arm in_header between files, so the second
+        # file's own header was read as more of the first file's hunk and
+        # the dotenv path was never seen.
+        dotenv = "." + "env"
+        diff = (
+            "--- a/README.md\n"
+            "+++ b/README.md\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+            "--- /dev/null\n"
+            f"+++ b/{dotenv}\n"
+            "@@ -0,0 +1 @@\n"
+            "+API_URL=https://example.com\n"
+        )
+        labels = [f.label for f in rc.scan_added_lines(diff)]
+        self.assertIn("dotenv file", labels)
+
+    def test_plain_multi_file_diff_flags_a_dotenv_in_the_middle(self):
+        dotenv = "." + "env"
+        diff = (
+            "--- a/one.txt\n"
+            "+++ b/one.txt\n"
+            "@@ -1 +1 @@\n"
+            "-old one\n"
+            "+new one\n"
+            "--- /dev/null\n"
+            f"+++ b/{dotenv}\n"
+            "@@ -0,0 +1 @@\n"
+            "+API_URL=https://example.com\n"
+            "--- a/three.txt\n"
+            "+++ b/three.txt\n"
+            "@@ -1 +1 @@\n"
+            "-old three\n"
+            "+new three\n"
+        )
+        labels = [f.label for f in rc.scan_added_lines(diff)]
+        self.assertIn("dotenv file", labels)
+
+    def test_plain_multi_file_diff_flags_a_dotenv_first(self):
+        # Already correct before the fix, since the first file's header is
+        # read while in_header is still true from initialisation. Pinned so
+        # a fix for the other cases can't flip this one.
+        dotenv = "." + "env"
+        diff = (
+            "--- /dev/null\n"
+            f"+++ b/{dotenv}\n"
+            "@@ -0,0 +1 @@\n"
+            "+API_URL=https://example.com\n"
+            "--- a/README.md\n"
+            "+++ b/README.md\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+        labels = [f.label for f in rc.scan_added_lines(diff)]
+        self.assertIn("dotenv file", labels)
+
     SCANNER_FILE_DIFF = (
         "diff --git a/test_redaction_check.py b/test_redaction_check.py\n"
         "index 1..2 100644\n"
@@ -953,6 +1013,25 @@ class CLITests(unittest.TestCase):
         )
         code, _out, _err = run_main([], stdin_text=diff)
         self.assertEqual(code, 0)
+
+    def test_plain_multi_file_diff_via_stdin_flags_a_dotenv_second(self):
+        # Same shape as the parser-level regression, exercised through the
+        # CLI's stdin path (no --base, no diff --git lines in the input).
+        dotenv = "." + "env"
+        diff = (
+            "--- a/README.md\n"
+            "+++ b/README.md\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+            "--- /dev/null\n"
+            f"+++ b/{dotenv}\n"
+            "@@ -0,0 +1 @@\n"
+            "+API_URL=https://example.com\n"
+        )
+        code, out, _err = run_main(["--diff-file", "-"], stdin_text=diff)
+        self.assertEqual(code, 1)
+        self.assertIn("Possible dotenv file", out)
 
     def test_patterns_file_argument_is_wired_through_the_cli(self):
         diff = (

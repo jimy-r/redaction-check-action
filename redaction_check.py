@@ -416,9 +416,13 @@ def parse_added_lines(diff_text: str) -> Iterator[tuple[str, int, str]]:
     line is part of its content, never a break that would strip the "+" from
     the text after it and hide that text from the scan.
 
-    `---` and `+++` are file headers only between a `diff --git` line and
-    that file's first hunk. Inside a hunk, `+++ /dev/null` is an added line
-    whose text starts with "++ ", not a header that ends the file.
+    `---` and `+++` are file headers only right after a `diff --git` line,
+    or -- since a plain diff has no such line to mark a new file -- right
+    after the previous file's last hunk, recognised there as a `---` line
+    immediately followed by a `+++ ` line. Inside a hunk, `+++ /dev/null`
+    is an added line whose text starts with "++ ", not a header that ends
+    the file; it never has its own `--- ` line directly above it, so the
+    pair check does not reclassify it.
 
     In a merge commit's combined diff each line opens with one mark per
     parent. Only a line marked `+` against every parent, one that no parent
@@ -428,9 +432,23 @@ def parse_added_lines(diff_text: str) -> Iterator[tuple[str, int, str]]:
     lineno = 0
     parents = 1
     in_header = True  # a plain unified diff opens with ---/+++, no diff --git
-    for line in diff_text.split("\n"):
+    lines = diff_text.split("\n")
+    for i, line in enumerate(lines):
         if DIFF_HEADER_RE.match(line):
             path = None  # each file block starts clean; no cross-file bleed
+            in_header = True
+            continue
+        if (
+            not in_header
+            and line.startswith("--- ")
+            and i + 1 < len(lines)
+            and lines[i + 1].startswith("+++ ")
+        ):
+            # A plain diff has no `diff --git` line to re-arm in_header
+            # between files, so without this, the next file's own header
+            # (sitting right after the previous file's last hunk) is read
+            # as more hunk content under the previous file's stale path.
+            path = None
             in_header = True
             continue
         if line.startswith("@@"):
