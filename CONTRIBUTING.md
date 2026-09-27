@@ -4,7 +4,7 @@ Issues and pull requests are welcome, pattern proposals especially. This is main
 
 ## The rule that is not negotiable
 
-A finding never prints the thing it caught. Every match collapses to a short SHA-256 prefix before it reaches the log, so a run on a public repository cannot itself become the leak. `test_redaction_check.py` asserts the raw matched text is absent from every output path, for every pattern class. A change that prints a matched value, adds a verbose mode that prints one, or drops one of those assertions gets closed on principle however good the rest of it is.
+A finding never prints the thing it caught. Every match collapses to a short keyed-hash tag before it reaches the log, so a run on a public repository cannot itself become the leak. `test_redaction_check.py` asserts the raw matched text is absent from every output path, for every pattern class. A change that prints a matched value, adds a verbose mode that prints one, or drops one of those assertions gets closed on principle however good the rest of it is.
 
 The second rule follows from the first. Patterns stay high-confidence. A gate that false-positives on ordinary prose gets disabled by the second annoyed contributor, which is worse than no gate at all.
 
