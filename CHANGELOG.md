@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Thi
 
 ## [Unreleased]
 
+### Fixed
+
+- OpenAI project, service-account and admin keys are reported. The OpenAI pattern matched `sk-` followed by one unbroken alphanumeric run, which is the legacy key shape. Keys that start `sk-proj-`, `sk-svcacct-` or `sk-admin-` break that run at the second hyphen, and their bodies hold `_` and `-`, so every current key shape passed the scan. The pattern now matches those three prefixes with a body of 20 or more characters, and still matches the legacy shape. A prefix named in prose with no key after it is not reported.
+
 ## [1.1.0] - 2026-09-28
 
 ### Added

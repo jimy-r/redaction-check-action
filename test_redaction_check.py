@@ -134,6 +134,30 @@ class CredentialTests(unittest.TestCase):
         hits = rc.scan_line("export OPENAI_API_KEY=" + "sk-" + "A" * 30)
         self.assertEqual([label for label, _ in hits], ["OpenAI-style API key"])
 
+    def test_openai_prefixed_keys(self):
+        # Project, service-account and admin keys. The body holds "_" and "-",
+        # which the legacy alphanumeric run stops at.
+        body = "Ab1_" * 6 + "-" + "Z9" * 12
+        for prefix in ("sk-proj-", "sk-svcacct-", "sk-admin-"):
+            with self.subTest(prefix=prefix):
+                key = prefix + body
+                hits = rc.scan_line("export OPENAI_API_KEY=" + key)
+                self.assertEqual(hits, [("OpenAI-style API key", key)])
+
+    def test_openai_prefixed_key_ending_in_a_separator_is_matched_whole(self):
+        key = "sk-proj-" + "A" * 24 + "_-"
+        hits = rc.scan_line("key " + key + " here")
+        self.assertEqual(hits, [("OpenAI-style API key", key)])
+
+    def test_openai_prefix_named_in_prose_is_not_flagged(self):
+        self.assertEqual(
+            rc.scan_line(
+                "project keys start with sk-proj- and admin keys with sk-admin-, "
+                "set on the sk-project-settings page"
+            ),
+            [],
+        )
+
     def test_aws_access_key(self):
         hits = rc.scan_line("key " + "AKIA" + "EXAMPLE000000000" + " here")
         self.assertEqual([label for label, _ in hits], ["AWS access key ID"])
@@ -383,6 +407,7 @@ class MaskingTests(unittest.TestCase):
         "real.person" + "@gmail.com",
         "/home/" + "prodserver7" + "/config",
         "sk-ant-" + "api03EXAMPLEKEY0000000",
+        "sk-proj-" + "EXAMPLE_KEY-0000000000000",
         "AKIA" + "EXAMPLE000000000",
         "10.20.30.40",
         "build7" + ".local",
