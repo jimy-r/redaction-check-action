@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Thi
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-10-04
+
 ### Fixed
 
 - OpenAI project, service-account and admin keys are reported. The OpenAI pattern matched `sk-` followed by one unbroken alphanumeric run, which is the legacy key shape. Keys that start `sk-proj-`, `sk-svcacct-` or `sk-admin-` break that run at the second hyphen, and their bodies hold `_` and `-`, so every current key shape passed the scan. The pattern now matches those three prefixes with a body of 20 or more characters, and still matches the legacy shape. A prefix named in prose with no key after it is not reported.
@@ -54,5 +56,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Thi
 - What the scanner prints into a workflow command is escaped as `@actions/core` escapes it, `%`, CR and LF in a message, and `:` and `,` in a property as well. A file name carrying a newline could end the command, forge a warning and a `::stop-commands::`, and silence every real finding after it. The action escapes the `base-ref` it prints on a failed fetch the same way.
 - A `base-ref` that starts with `-` or holds a control character is refused before any git command runs, and the step exits 2. git reads such a value as an option, and `--upload-pack=<command>` runs that command over a file or ssh remote. The script applies the same check to `--base` and `--allow-ref`, and refuses an `--allow-file` holding a control character, since that path is printed on a line of its own.
 
-[Unreleased]: https://github.com/jimy-r/redaction-check-action/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/jimy-r/redaction-check-action/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/jimy-r/redaction-check-action/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/jimy-r/redaction-check-action/compare/v1.0.1...v1.1.0
