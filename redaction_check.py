@@ -120,9 +120,18 @@ PATH_PLACEHOLDERS = {
 # rate on ordinary prose is low. New classes should meet the same bar.
 CRED_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("Anthropic API key", re.compile(r"sk-ant-[A-Za-z0-9_-]{8,}")),
-    # Checked after the Anthropic pattern's own hyphens break its longer
-    # run, so a real sk-ant-... key is never double-counted under this one.
-    ("OpenAI-style API key", re.compile(r"\bsk-[A-Za-z0-9]{20,}\b")),
+    # OpenAI publishes two shapes. A legacy key is sk- and one unbroken
+    # alphanumeric run. Project, service-account and admin keys carry a second
+    # prefix (sk-proj-, sk-svcacct-, sk-admin-) and a body that can hold "_"
+    # and "-", where the legacy run stops. One pattern covers both, so a key
+    # is reported once. "ant" is neither a listed prefix nor the start of a
+    # 20-character run, so a real sk-ant-... key is never double-counted here.
+    (
+        "OpenAI-style API key",
+        re.compile(
+            r"\bsk-(?:(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}|[A-Za-z0-9]{20,}\b)"
+        ),
+    ),
     ("AWS access key ID", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     (
         "GitHub token",
@@ -1392,6 +1401,7 @@ def run_selftest() -> int:
         "path was /home/" + "realname" + "/.config",
         "C:" + "\\Users\\" + "realname\\notes",
         "token " + "sk-ant-" + "EXAMPLE00000000000",
+        "token " + "sk-proj-" + "EXAMPLE_KEY-0000000000000",
         "key " + "AKIA" + "EXAMPLE000000000" + " here",
         "internal host at 192.168" + ".1.42",
         "reachable at build7" + ".local on the LAN",
@@ -1407,6 +1417,7 @@ def run_selftest() -> int:
         "loopback is 127.0.0.1 in every stack",
         "runs fine on runner" + ".local for CI",
         "copy .claude/settings" + ".local.json over the defaults",
+        "project keys start with sk-proj- and admin keys with sk-admin-",
     ]
     ok = True
     for s in must_flag:
