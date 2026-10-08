@@ -1,8 +1,8 @@
 name: Redaction check
+# The Marketplace takes a description under 125 characters.
 description: >-
-  Scan a pull request's added lines for the shapes of private content --
-  emails, absolute home paths, credential prefixes, private-IP/hostname
-  shapes, and common secret-file names -- before it merges.
+  Scan a pull request's added lines for private content: emails, home
+  paths, credentials and secret-file names.
 author: James Ross
 
 branding:
