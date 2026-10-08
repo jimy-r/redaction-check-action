@@ -6,6 +6,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Thi
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-10-08
+
+### Changed
+
+- The action's description is shorter. The GitHub Marketplace takes a description under 125 characters, and the old one ran past that, so the action could not be listed. The scanner itself is unchanged.
+
 ## [1.1.1] - 2026-10-04
 
 ### Fixed
@@ -56,6 +62,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Thi
 - What the scanner prints into a workflow command is escaped as `@actions/core` escapes it, `%`, CR and LF in a message, and `:` and `,` in a property as well. A file name carrying a newline could end the command, forge a warning and a `::stop-commands::`, and silence every real finding after it. The action escapes the `base-ref` it prints on a failed fetch the same way.
 - A `base-ref` that starts with `-` or holds a control character is refused before any git command runs, and the step exits 2. git reads such a value as an option, and `--upload-pack=<command>` runs that command over a file or ssh remote. The script applies the same check to `--base` and `--allow-ref`, and refuses an `--allow-file` holding a control character, since that path is printed on a line of its own.
 
-[Unreleased]: https://github.com/jimy-r/redaction-check-action/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/jimy-r/redaction-check-action/compare/v1.1.2...HEAD
+[1.1.2]: https://github.com/jimy-r/redaction-check-action/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/jimy-r/redaction-check-action/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/jimy-r/redaction-check-action/compare/v1.0.1...v1.1.0
