@@ -1,13 +1,31 @@
 # CI toolchain pins are deliberate (see .github/requirements-ci.txt); this is
 # what surfaces bumps as reviewable PRs instead of depending on someone
 # remembering to check. Weekly, matches the pattern in signal-sweep.
+#
+# groups: one pull request per ecosystem each week, so related bumps land
+# together instead of as separate PRs that each run the full check set.
+#
+# cooldown: a release is proposed once it is seven days old (GitHub's default
+# is three). It delays version updates only, never security updates.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    groups:
+      actions:
+        patterns:
+          - "*"
+    cooldown:
+      default-days: 7
   - package-ecosystem: pip
     directory: /.github
     schedule:
       interval: weekly
+    groups:
+      ci-tools:
+        patterns:
+          - "*"
+    cooldown:
+      default-days: 7
